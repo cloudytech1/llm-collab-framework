@@ -1,0 +1,41 @@
+{
+  "max_iterations_default": 3,
+  "token_budget_per_round_file": 6000,
+  "token_budget_per_entry": 800,
+  "score_proximity_warning_delta": 0.3,
+  "scoring_weights": {
+    "goal_alignment": 0.25,
+    "simplicity": 0.20,
+    "testability": 0.20,
+    "robustness": 0.20,
+    "extensibility": 0.15
+  },
+  "forbidden_phrases": [
+    "I agree",
+    "great point",
+    "you're right",
+    "exactly",
+    "well said",
+    "good idea",
+    "nice approach",
+    "that makes sense"
+  ],
+  "cli": {
+    "claude": {
+      "command": "claude",
+      "flags": ["-p", "--output-format", "text", "--max-turns", "1", "--dangerously-skip-permissions"],
+      "model": null
+    },
+    "codex": {
+      "command": "codex",
+      "flags": ["--quiet", "--full-auto", "--dangerously-bypass-approvals-and-sandbox"],
+      "model": null
+    }
+  },
+  "git_auto_commit": true,
+  "human_notification": {
+    "method": "terminal",
+    "slack_webhook": null,
+    "email": null
+  }
+}

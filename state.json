@@ -1,0 +1,13 @@
+{
+  "project": "",
+  "round": "r00",
+  "iteration": 0,
+  "state": "IDLE",
+  "turn": "HUMAN",
+  "max_iterations": 3,
+  "token_budget_per_entry": 800,
+  "round_file": null,
+  "last_updated": null,
+  "score_proximity_warning": false,
+  "history": []
+}
