@@ -33,6 +33,12 @@
     }
   },
   "git_auto_commit": true,
+  "stuck_state_timeout_hours": 24,
+  "validation": {
+    "command": null,
+    "timeout_seconds": 120,
+    "on_failure": "reopen_round"
+  },
   "human_notification": {
     "method": "terminal",
     "slack_webhook": null,

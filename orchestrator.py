@@ -26,13 +26,29 @@ LOCK_FILE = REPO_ROOT / "state.lock"
 ROUNDS_DIR = REPO_ROOT / "collaboration" / "rounds"
 DECISIONS_DIR = REPO_ROOT / "collaboration" / "decisions"
 PLEAS_DIR = REPO_ROOT / "collaboration" / "pleas"
+CALIBRATION_DIR = REPO_ROOT / "calibration"
+VALIDATIONS_DIR = REPO_ROOT / "collaboration" / "validations"
+COMPROMISE_DIR = REPO_ROOT / "collaboration" / "compromise"
+INDEX_FILE = REPO_ROOT / "collaboration" / "index.yaml"
+METRICS_FILE = REPO_ROOT / "metrics.jsonl"
 
 VALID_STATES = [
-    "IDLE", "PROPOSED", "DEBATED", "SCORED",
-    "AGREED", "DEADLOCKED", "HUMAN_REVIEW", "COMPLETE"
+    "IDLE", "PROPOSED", "DEBATED", "SCORED", "SYNTHESIZED",
+    "AGREED", "DEADLOCKED", "HUMAN_REVIEW",
+    "IMPLEMENT", "TEST", "VALIDATED", "FAILED", "COMPLETE"
 ]
 VALID_TURNS = ["CLAUDE", "CODEX", "HUMAN"]
 LLM_IDS = ["CLAUDE", "CODEX"]
+
+# ──────────────────────────────────────────────────────────────────────
+# Directory bootstrap
+# ──────────────────────────────────────────────────────────────────────
+
+def ensure_dirs():
+    """Create all required directories on first run."""
+    for d in [ROUNDS_DIR, DECISIONS_DIR, PLEAS_DIR, CALIBRATION_DIR,
+              VALIDATIONS_DIR, COMPROMISE_DIR]:
+        d.mkdir(parents=True, exist_ok=True)
 
 # ──────────────────────────────────────────────────────────────────────
 # Config & State helpers
@@ -45,7 +61,6 @@ def load_json(path: Path) -> dict:
 def save_json(path: Path, data: dict):
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
-    f.close()
 
 def load_config() -> dict:
     return load_json(CONFIG_FILE)
@@ -61,6 +76,16 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 # ──────────────────────────────────────────────────────────────────────
+# Metrics
+# ──────────────────────────────────────────────────────────────────────
+
+def append_metric(record: dict):
+    """Append a single JSON record to metrics.jsonl."""
+    record["ts"] = now_iso()
+    with open(METRICS_FILE, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+# ──────────────────────────────────────────────────────────────────────
 # Write Lock Protocol
 # ──────────────────────────────────────────────────────────────────────
 
@@ -73,7 +98,6 @@ class WriteLock:
         self.poll = poll
 
     def _is_locked(self) -> bool:
-        """Check if lock is actively held (file exists and is non-empty)."""
         if not LOCK_FILE.exists():
             return False
         try:
@@ -100,7 +124,6 @@ class WriteLock:
             if LOCK_FILE.exists():
                 LOCK_FILE.unlink()
         except OSError:
-            # Fallback: write empty to signal release
             try:
                 LOCK_FILE.write_text("")
             except OSError:
@@ -128,10 +151,8 @@ def git_commit(message: str):
 def git_init_if_needed():
     git_dir = REPO_ROOT / ".git"
     if not git_dir.exists():
-        env = os.environ.copy()
         try:
             subprocess.run(["git", "init"], cwd=REPO_ROOT, check=True, capture_output=True)
-            # Ensure git user is configured for this repo
             subprocess.run(
                 ["git", "config", "user.email", "orchestrator@llm-collab"],
                 cwd=REPO_ROOT, check=True, capture_output=True
@@ -148,6 +169,24 @@ def git_init_if_needed():
             print("[git] initialized repository")
         except subprocess.CalledProcessError as e:
             print(f"[git] init warning: {e}")
+
+# ──────────────────────────────────────────────────────────────────────
+# Round Index
+# ──────────────────────────────────────────────────────────────────────
+
+def update_index(state: dict, outcome: str, summary: str):
+    """Append a round entry to collaboration/index.yaml."""
+    entry_lines = [
+        f"- id: {state['round']}",
+        f"  title: \"{state.get('round_title', state['round'])}\"",
+        f"  outcome: {outcome}",
+        f"  iteration_count: {state['iteration']}",
+        f"  file: \"{state.get('round_file', '')}\"",
+        f"  summary: \"{summary.replace(chr(34), chr(39))}\"",
+        f"  ts: {now_iso()}",
+    ]
+    with open(INDEX_FILE, "a") as f:
+        f.write("\n".join(entry_lines) + "\n\n")
 
 # ──────────────────────────────────────────────────────────────────────
 # System Prompt Generator
@@ -173,6 +212,16 @@ def build_system_prompt(llm_id: str, state: dict, config: dict) -> str:
     if accepted_path.exists():
         accepted_context = accepted_path.read_text()
 
+    calibration_text = ""
+    calibration_path = CALIBRATION_DIR / "scoring_examples.md"
+    if calibration_path.exists():
+        calibration_text = calibration_path.read_text()
+
+    failure_context = ""
+    last_failure = state.get("last_validation_failure")
+    if last_failure:
+        failure_context = f"\n== LAST VALIDATION FAILURE ==\n{last_failure}\n"
+
     return f"""You are {llm_id} in a structured LLM collaboration framework.
 You are debating technical decisions with your counterpart to produce the best possible outcome.
 
@@ -192,12 +241,16 @@ Max iterations this round: {state['max_iterations']}
 
 == CURRENT ROUND FILE ==
 {round_context if round_context else "(empty — you are writing the first entry)"}
-
+{failure_context}
 == SCORING RUBRIC ==
 Score the opposing proposal ONLY. Commit numeric scores BEFORE writing reasoning.
 Dimensions and weights:
 {weight_lines}
 Score each dimension 1–5. Final score = weighted average.
+A score of 1 or 5 on any dimension MUST be accompanied by a code block or concrete example.
+
+== CALIBRATION EXAMPLES ==
+{calibration_text if calibration_text else "(none — use rubric weights as sole anchor)"}
 
 == ANTI-SYCOPHANCY RULES (MANDATORY) ==
 1. Score first, justify second — write numeric scores before reasoning.
@@ -213,7 +266,7 @@ Start every entry with this exact YAML header:
 FROM: {llm_id}
 ROUND: {state['round']}
 ITER: {state['iteration']}
-STATE: PROPOSED | SCORED | PLEA
+STATE: PROPOSED | SCORED | SYNTHESIZED | PLEA
 TS: [current ISO timestamp]
 ---
 
@@ -231,17 +284,14 @@ Then write your technical content below the header.
 # ──────────────────────────────────────────────────────────────────────
 
 def invoke_claude(prompt: str, system_prompt: str, dry_run: bool = False) -> str:
-    """Invoke Claude Code CLI: claude -p '<prompt>' --system-prompt '<system>'"""
+    """Invoke Claude Code CLI."""
     config = load_config()
     cli_cfg = config.get("cli", {}).get("claude", {})
     cmd = cli_cfg.get("command", "claude")
     base_flags = cli_cfg.get("flags", ["-p", "--output-format", "text", "--max-turns", "1"])
 
-    # Build command: claude -p "prompt" --system-prompt "system"
     full_cmd = [cmd] + base_flags.copy()
 
-    # -p flag expects the prompt as the next arg
-    # If -p is in base_flags, the prompt follows it; otherwise append
     if "-p" in full_cmd:
         idx = full_cmd.index("-p")
         full_cmd.insert(idx + 1, prompt)
@@ -254,8 +304,7 @@ def invoke_claude(prompt: str, system_prompt: str, dry_run: bool = False) -> str
         full_cmd.extend(["--model", cli_cfg["model"]])
 
     if dry_run:
-        print(f"\n  [DRY RUN] Would invoke CLAUDE:")
-        print(f"  Command: {' '.join(full_cmd[:5])}... ({len(prompt)} char prompt)")
+        print(f"\n  [DRY RUN] Would invoke CLAUDE ({len(prompt)} char prompt)")
         return _dry_run_stub("CLAUDE")
 
     print(f"  [CLAUDE] invoking claude CLI...")
@@ -267,28 +316,26 @@ def invoke_claude(prompt: str, system_prompt: str, dry_run: bool = False) -> str
             print(f"  [CLAUDE] stderr: {result.stderr[:500]}")
             raise RuntimeError(f"Claude CLI failed: {result.stderr[:200]}")
         return result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("CLAUDE CLI timed out after 300s")
     except FileNotFoundError:
         raise RuntimeError("'claude' CLI not found. Install Claude Code: https://docs.anthropic.com/en/docs/claude-code")
 
 def invoke_codex(prompt: str, system_prompt: str, dry_run: bool = False) -> str:
-    """Invoke OpenAI Codex CLI: codex --quiet --full-auto '<prompt>'"""
+    """Invoke OpenAI Codex CLI."""
     config = load_config()
     cli_cfg = config.get("cli", {}).get("codex", {})
     cmd = cli_cfg.get("command", "codex")
     base_flags = cli_cfg.get("flags", ["--quiet", "--full-auto"])
 
-    # Codex takes the prompt as a positional argument
-    # We prepend the system prompt to the user prompt since codex doesn't have --system-prompt
     combined_prompt = f"SYSTEM INSTRUCTIONS:\n{system_prompt}\n\n---\n\nTASK:\n{prompt}"
-
     full_cmd = [cmd] + base_flags + [combined_prompt]
 
     if cli_cfg.get("model"):
         full_cmd.extend(["--model", cli_cfg["model"]])
 
     if dry_run:
-        print(f"\n  [DRY RUN] Would invoke CODEX:")
-        print(f"  Command: {cmd} {' '.join(base_flags)}... ({len(combined_prompt)} char prompt)")
+        print(f"\n  [DRY RUN] Would invoke CODEX ({len(combined_prompt)} char prompt)")
         return _dry_run_stub("CODEX")
 
     print(f"  [CODEX] invoking codex CLI...")
@@ -300,6 +347,8 @@ def invoke_codex(prompt: str, system_prompt: str, dry_run: bool = False) -> str:
             print(f"  [CODEX] stderr: {result.stderr[:500]}")
             raise RuntimeError(f"Codex CLI failed: {result.stderr[:200]}")
         return result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("CODEX CLI timed out after 300s")
     except FileNotFoundError:
         raise RuntimeError("'codex' CLI not found. Install: npm install -g @openai/codex")
 
@@ -349,11 +398,9 @@ def check_forbidden_phrases(text: str, config: dict) -> list[str]:
 
 def parse_scores_from_entry(text: str) -> Optional[float]:
     """Extract the TOTAL weighted score from a SCORED entry."""
-    # Look for **TOTAL** | **X.XX** pattern
     match = re.search(r'\*\*TOTAL\*\*\s*\|\s*\*\*(\d+\.?\d*)\*\*', text)
     if match:
         return float(match.group(1))
-    # Fallback: look for "TOTAL" row in a table
     match = re.search(r'TOTAL\s*\|\s*(\d+\.?\d*)', text, re.IGNORECASE)
     if match:
         return float(match.group(1))
@@ -397,7 +444,7 @@ def close_round_file(filepath: Path):
 def append_decision_summary(accepted: bool, round_id: str, summary: str):
     """Append a decision summary to accepted.md or rejected.md."""
     target = DECISIONS_DIR / ("accepted.md" if accepted else "rejected.md")
-    current = target.read_text()
+    current = target.read_text() if target.exists() else ""
     entry = f"\n## {round_id} — {now_iso()}\n\n{summary}\n\n---\n"
     target.write_text(current + entry)
 
@@ -406,20 +453,16 @@ def append_decision_summary(accepted: bool, round_id: str, summary: str):
 # ──────────────────────────────────────────────────────────────────────
 
 def notify_human(message: str):
-    """Notify the human operator. Currently: terminal bell + print."""
+    """Notify the human operator."""
     print(f"\n{'='*60}")
     print(f"  HUMAN REVIEW REQUIRED")
     print(f"{'='*60}")
     print(f"  {message}")
     print(f"{'='*60}\n")
-    # Terminal bell
     print("\a", end="")
 
 def prompt_human_review(state: dict) -> str:
-    """
-    Block on human input at a HUMAN_REVIEW gate.
-    Returns the command string.
-    """
+    """Block on human input at a HUMAN_REVIEW gate. Returns the command string."""
     notify_human(
         f"Round: {state['round']} | Iteration: {state['iteration']} | State: {state['state']}\n"
         f"  Round file: {state.get('round_file', 'N/A')}"
@@ -427,9 +470,11 @@ def prompt_human_review(state: dict) -> str:
 
     print("Commands:")
     print("  ACCEPT                — Accept current proposal")
-    print("  REJECT                — Reject; round re-opens")
-    print("  EXTEND +N             — Grant N more iterations")
+    print("  REJECT                — Reject; round re-opens with fresh proposals")
+    print("  EXTEND +N             — Grant N more iterations before deadlock")
     print("  OVERRIDE CLAUDE|CODEX — Force-accept one LLM's proposal")
+    if state["state"] == "AGREED":
+        print("  IMPLEMENT             — Generate implementation artifacts for this round")
     print("  APPROVE_NEXT_ROUND    — Advance to next round")
     print("  QUIT                  — Exit orchestrator")
     print()
@@ -445,7 +490,7 @@ def prompt_human_review(state: dict) -> str:
             continue
 
         upper = cmd.upper()
-        if upper in ("ACCEPT", "REJECT", "QUIT", "APPROVE_NEXT_ROUND"):
+        if upper in ("ACCEPT", "REJECT", "QUIT", "APPROVE_NEXT_ROUND", "IMPLEMENT"):
             return upper
         if upper.startswith("EXTEND"):
             parts = upper.split()
@@ -470,25 +515,23 @@ def prompt_human_review(state: dict) -> str:
 # R01 Seeding — LLM decomposes seed.md into rounds
 # ──────────────────────────────────────────────────────────────────────
 
-def seed_r01(dry_run: bool = False) -> list[dict]:
+def seed_r01(dry_run: bool = False):
     """
     Have CLAUDE propose a problem decomposition from seed.md,
     then CODEX critique it. Human approves the final round plan.
-    Returns a list of round descriptors: [{"id": "r02", "title": "..."}, ...]
     """
     state = load_state()
     config = load_config()
 
-    # Create r01 round file
     rf = create_round_file("r01", "problem_decomposition")
     state["round"] = "r01"
+    state["round_title"] = "problem_decomposition"
     state["iteration"] = 1
     state["state"] = "PROPOSED"
     state["turn"] = "CLAUDE"
     state["round_file"] = str(rf.relative_to(REPO_ROOT))
     save_state(state)
 
-    # CLAUDE proposes decomposition
     sys_prompt = build_system_prompt("CLAUDE", state, config)
     proposal_prompt = (
         "Read the project seed above. Decompose it into discrete sub-problems, "
@@ -502,7 +545,10 @@ def seed_r01(dry_run: bool = False) -> list[dict]:
     )
 
     with WriteLock("CLAUDE"):
+        t0 = time.time()
         claude_output = invoke_llm("CLAUDE", proposal_prompt, sys_prompt, dry_run)
+        append_metric({"round": "r01", "iter": 1, "llm": "CLAUDE", "action": "PROPOSED",
+                        "duration_s": round(time.time() - t0, 2), "output_len": len(claude_output)})
         append_to_round_file(rf, claude_output)
         state["turn"] = "CODEX"
         state["state"] = "DEBATED"
@@ -510,7 +556,6 @@ def seed_r01(dry_run: bool = False) -> list[dict]:
 
     git_commit("r01_iter1_CLAUDE")
 
-    # CODEX critiques and counter-proposes
     state = load_state()
     sys_prompt = build_system_prompt("CODEX", state, config)
     critique_prompt = (
@@ -524,7 +569,10 @@ def seed_r01(dry_run: bool = False) -> list[dict]:
     )
 
     with WriteLock("CODEX"):
+        t0 = time.time()
         codex_output = invoke_llm("CODEX", critique_prompt, sys_prompt, dry_run)
+        append_metric({"round": "r01", "iter": 1, "llm": "CODEX", "action": "SCORED",
+                        "duration_s": round(time.time() - t0, 2), "output_len": len(codex_output)})
         append_to_round_file(rf, codex_output)
         state["turn"] = "HUMAN"
         state["state"] = "HUMAN_REVIEW"
@@ -532,12 +580,9 @@ def seed_r01(dry_run: bool = False) -> list[dict]:
 
     git_commit("r01_iter1_CODEX")
 
-    # Human reviews
     state = load_state()
     cmd = prompt_human_review(state)
     handle_human_command(cmd, state, config)
-
-    return []  # Rounds are parsed from the accepted file by the main loop
 
 # ──────────────────────────────────────────────────────────────────────
 # State Machine Core
@@ -561,21 +606,24 @@ def run_proposal_turn(state: dict, config: dict, dry_run: bool = False):
 
     rf = REPO_ROOT / state["round_file"]
     with WriteLock(llm_id):
+        t0 = time.time()
         output = invoke_llm(llm_id, prompt, sys_prompt, dry_run)
+        duration = round(time.time() - t0, 2)
 
-        # Check forbidden phrases
         violations = check_forbidden_phrases(output, config)
         if violations:
             print(f"  [WARN] {llm_id} used forbidden phrases: {violations}")
 
         append_to_round_file(rf, output)
+        append_metric({"round": state["round"], "iter": state["iteration"], "llm": llm_id,
+                        "action": "PROPOSED", "duration_s": duration, "output_len": len(output)})
         state["turn"] = other_llm(llm_id)
         state["state"] = "PROPOSED"
         save_state(state)
 
-    git_commit(f"{state['round']}_iter{state['iteration']}_{llm_id}")
+    git_commit(f"{state['round']}_iter{state['iteration']}_{llm_id}_proposed")
 
-def run_scoring_turn(state: dict, config: dict, dry_run: bool = False):
+def run_scoring_turn(state: dict, config: dict, dry_run: bool = False) -> str:
     """Execute a SCORED turn: the current LLM scores the opposing proposal."""
     llm_id = state["turn"]
     sys_prompt = build_system_prompt(llm_id, state, config)
@@ -584,41 +632,119 @@ def run_scoring_turn(state: dict, config: dict, dry_run: bool = False):
         "You are writing a SCORED entry. Score the opposing LLM's most recent proposal.\n"
         "IMPORTANT: Commit your numeric scores FIRST, then write reasoning.\n"
         "You MUST include a ## Weaknesses section with at least 2 specific criticisms.\n"
+        "A score of 1 or 5 on any dimension requires a code block or concrete example.\n"
         "End with a ## Verdict: state which proposal is better or TIE.\n"
         "Format as a SCORED entry with the standard YAML header and the scoring table."
     )
 
     rf = REPO_ROOT / state["round_file"]
     with WriteLock(llm_id):
+        t0 = time.time()
         output = invoke_llm(llm_id, prompt, sys_prompt, dry_run)
+        duration = round(time.time() - t0, 2)
 
         violations = check_forbidden_phrases(output, config)
         if violations:
             print(f"  [WARN] {llm_id} used forbidden phrases: {violations}")
 
-        # Check for missing weaknesses
         if "## Weaknesses" not in output and "## weaknesses" not in output.lower():
             print(f"  [WARN] {llm_id} SCORED entry missing ## Weaknesses section!")
 
+        score = parse_scores_from_entry(output)
         append_to_round_file(rf, output)
+        append_metric({"round": state["round"], "iter": state["iteration"], "llm": llm_id,
+                        "action": "SCORED", "score_given": score,
+                        "duration_s": duration, "output_len": len(output)})
         state["state"] = "SCORED"
         save_state(state)
 
     git_commit(f"{state['round']}_iter{state['iteration']}_{llm_id}_scored")
     return output
 
+def run_synthesis_turn(state: dict, config: dict, dry_run: bool, loser_llm: str):
+    """The lower-scoring LLM synthesizes a merged proposal."""
+    winner_llm = other_llm(loser_llm)
+    sys_prompt = build_system_prompt(loser_llm, state, config)
+
+    prompt = (
+        f"Your proposal was scored lower than {winner_llm}'s in this iteration.\n"
+        "You are writing a SYNTHESIZED entry — a merged design that:\n"
+        f"1. Explicitly adopts the strongest elements of {winner_llm}'s proposal (cite them)\n"
+        "2. Addresses the specific weaknesses identified in your own proposal\n"
+        "3. Produces a single coherent merged design — not a summary of both\n\n"
+        "Structure:\n"
+        f"## Adopted from {winner_llm}\n"
+        "- [element and why]\n\n"
+        "## Addressed in my proposal\n"
+        "- [weakness and how it's fixed]\n\n"
+        "## Merged Design\n"
+        "[Full merged proposal]\n\n"
+        "Format as a SYNTHESIZED entry with the standard YAML header."
+    )
+
+    rf = REPO_ROOT / state["round_file"]
+    with WriteLock(loser_llm):
+        t0 = time.time()
+        output = invoke_llm(loser_llm, prompt, sys_prompt, dry_run)
+        duration = round(time.time() - t0, 2)
+
+        violations = check_forbidden_phrases(output, config)
+        if violations:
+            print(f"  [WARN] {loser_llm} used forbidden phrases in synthesis: {violations}")
+
+        append_to_round_file(rf, output)
+        append_metric({"round": state["round"], "iter": state["iteration"], "llm": loser_llm,
+                        "action": "SYNTHESIZED", "duration_s": duration, "output_len": len(output)})
+        state["state"] = "SYNTHESIZED"
+        save_state(state)
+
+    git_commit(f"{state['round']}_iter{state['iteration']}_{loser_llm}_synthesized")
+
+def generate_compromise_template(state: dict, config: dict, dry_run: bool = False):
+    """Generate a structured compromise form on DEADLOCK."""
+    COMPROMISE_DIR.mkdir(parents=True, exist_ok=True)
+    template_path = COMPROMISE_DIR / f"{state['round']}_compromise_template.md"
+
+    sys_prompt = build_system_prompt("CLAUDE", state, config)
+    prompt = (
+        "The round has DEADLOCKED. Generate a structured compromise template for the human operator.\n"
+        "Review the round file and identify the 3-5 most contested specific technical decisions.\n\n"
+        "For each contested decision, output:\n"
+        "### Decision N: [one-sentence description]\n"
+        "- [ ] CLAUDE's position: [position]\n"
+        "- [ ] CODEX's position: [position]\n"
+        "- [ ] Custom: _______________\n\n"
+        "Be specific — each decision must be a concrete technical choice, not a vague theme.\n"
+        "The human will check boxes or fill in custom text to direct the compromise."
+    )
+
+    t0 = time.time()
+    output = invoke_llm("CLAUDE", prompt, sys_prompt, dry_run)
+    append_metric({"round": state["round"], "iter": state["iteration"], "llm": "CLAUDE",
+                    "action": "COMPROMISE_TEMPLATE", "duration_s": round(time.time() - t0, 2),
+                    "output_len": len(output)})
+
+    full_template = (
+        f"# Deadlock Compromise Template — Round {state['round']}\n"
+        f"Generated: {now_iso()}\n\n"
+        f"Read the plea files in collaboration/pleas/ then fill in this form.\n"
+        f"Issue ACCEPT at the >>> prompt when done.\n\n---\n\n{output}\n"
+    )
+    template_path.write_text(full_template)
+    git_commit(f"{state['round']}_compromise_template")
+    print(f"  [DEADLOCK] Compromise template: {template_path.relative_to(REPO_ROOT)}")
+
 def run_debate_iteration(state: dict, config: dict, dry_run: bool = False):
     """
     Run one full debate iteration:
-    1. First LLM proposes (or rebuts)
-    2. Second LLM proposes (or rebuts)
-    3. Both score each other
-    4. Check for agreement
+    1. Both LLMs propose
+    2. Both LLMs score each other
+    3. Loser synthesizes a merged proposal
+    4. → HUMAN_REVIEW (or DEADLOCKED if max iterations exceeded)
     """
     first = state["turn"]
     second = other_llm(first)
 
-    # Both propose
     print(f"\n--- Iteration {state['iteration']} ---")
 
     print(f"  [{first}] proposing...")
@@ -628,50 +754,56 @@ def run_debate_iteration(state: dict, config: dict, dry_run: bool = False):
     print(f"  [{second}] proposing...")
     run_proposal_turn(state, config, dry_run)
 
-    # Both score (blind — first scores second's proposal, then second scores first's)
+    # Both score
     state = load_state()
     state["turn"] = first
     save_state(state)
-
     print(f"  [{first}] scoring {second}'s proposal...")
-    score_output_a = run_scoring_turn(state, config, dry_run)
+    score_output_a = run_scoring_turn(state, config, dry_run)  # first scores second's proposal
 
     state = load_state()
     state["turn"] = second
     save_state(state)
-
     print(f"  [{second}] scoring {first}'s proposal...")
-    score_output_b = run_scoring_turn(state, config, dry_run)
+    score_output_b = run_scoring_turn(state, config, dry_run)  # second scores first's proposal
 
-    # Parse scores and check proximity
+    # score_a = score given to second's proposal; score_b = score given to first's proposal
     score_a = parse_scores_from_entry(score_output_a)
     score_b = parse_scores_from_entry(score_output_b)
-    print(f"  Scores: {first}→{score_a}, {second}→{score_b}")
+    print(f"  Scores — {second}: {score_a}, {first}: {score_b}")
 
+    state = load_state()
     if check_score_proximity(score_a, score_b, config):
-        state = load_state()
         state["score_proximity_warning"] = True
         save_state(state)
         print(f"  [WARN] Score proximity warning — scores within delta")
 
-    # Check for agreement: if both verdicts favor the same proposal
-    # For simplicity, we go to HUMAN_REVIEW after scoring
+    # Determine loser: lower score = loser (synthesizer)
+    # score_a is for second, score_b is for first
+    if score_a is not None and score_b is not None:
+        loser = second if score_a < score_b else first
+    else:
+        loser = second  # fallback when scores unparseable
+
+    print(f"  [{loser}] synthesizing merged proposal...")
+    run_synthesis_turn(state, config, dry_run, loser)
+
     state = load_state()
     state["iteration"] += 1
 
     if state["iteration"] > state["max_iterations"]:
-        print(f"  Max iterations reached — escalating to HUMAN_REVIEW")
+        print(f"  Max iterations reached — DEADLOCKED")
         state["state"] = "DEADLOCKED"
         state["turn"] = "HUMAN"
         save_state(state)
         run_plea_protocol(state, config, dry_run)
     else:
-        state["state"] = "DEBATED"
-        state["turn"] = first  # Reset to first LLM for next iteration
+        state["state"] = "HUMAN_REVIEW"
+        state["turn"] = "HUMAN"
         save_state(state)
 
 def run_plea_protocol(state: dict, config: dict, dry_run: bool = False):
-    """Generate plea files from both LLMs on DEADLOCK."""
+    """Generate plea files and compromise template on DEADLOCK."""
     print("\n  [DEADLOCK] Generating plea files...")
 
     for llm_id in LLM_IDS:
@@ -682,21 +814,108 @@ def run_plea_protocol(state: dict, config: dict, dry_run: bool = False):
             "# Plea — {ID} — Round {round}\n\n"
             "## Core Argument\n[2-3 sentences defending your proposal]\n\n"
             "## Specific Failure Mode in Opposing Proposal\n"
-            "[Concrete technical failure scenario]\n\n"
+            "[Concrete technical failure scenario with conditions]\n\n"
             "## Concession\n"
             "[What you would modify if the human directs a compromise]\n"
         ).format(ID=llm_id, round=state["round"])
 
         plea_path = PLEAS_DIR / f"{state['round']}_plea_{llm_id}.md"
         with WriteLock(llm_id):
+            t0 = time.time()
             output = invoke_llm(llm_id, prompt, sys_prompt, dry_run)
+            append_metric({"round": state["round"], "iter": state["iteration"], "llm": llm_id,
+                            "action": "PLEA", "duration_s": round(time.time() - t0, 2),
+                            "output_len": len(output)})
             plea_path.write_text(output)
 
         git_commit(f"{state['round']}_plea_{llm_id}")
 
+    generate_compromise_template(state, config, dry_run)
+
     state["turn"] = "HUMAN"
     state["state"] = "HUMAN_REVIEW"
     save_state(state)
+
+# ──────────────────────────────────────────────────────────────────────
+# Implementation & Validation
+# ──────────────────────────────────────────────────────────────────────
+
+def run_implement_turn(state: dict, config: dict, dry_run: bool = False):
+    """CLAUDE generates implementation artifacts based on accepted decisions."""
+    print("\n  [IMPLEMENT] CLAUDE generating artifacts...")
+    sys_prompt = build_system_prompt("CLAUDE", state, config)
+
+    prompt = (
+        "Based on the accepted decisions documented above, generate the implementation artifacts.\n"
+        "Write all code, configs, and files needed to satisfy the accepted design.\n"
+        "Place source files under src/.\n"
+        "After writing files, output a ## Manifest section listing every file created and its purpose."
+    )
+
+    t0 = time.time()
+    output = invoke_llm("CLAUDE", prompt, sys_prompt, dry_run)
+    duration = round(time.time() - t0, 2)
+
+    impl_log = VALIDATIONS_DIR / f"{state['round']}_implement.md"
+    impl_log.write_text(
+        f"# Implementation Log — {state['round']}\nTS: {now_iso()}\n\n{output}\n"
+    )
+    append_metric({"round": state["round"], "iter": state["iteration"], "llm": "CLAUDE",
+                    "action": "IMPLEMENT", "duration_s": duration, "output_len": len(output)})
+
+    state["state"] = "TEST"
+    state["turn"] = "HUMAN"
+    save_state(state)
+    git_commit(f"{state['round']}_IMPLEMENT")
+    print("  [IMPLEMENT] Done. Running validation...")
+
+def run_test_phase(state: dict, config: dict, dry_run: bool = False):
+    """Run the configured validation command and transition to VALIDATED or FAILED."""
+    validation = config.get("validation", {})
+    cmd = validation.get("command")
+
+    if not cmd:
+        print("  [TEST] No validation.command in config — skipping to VALIDATED")
+        state["state"] = "VALIDATED"
+        save_state(state)
+        return
+
+    timeout = validation.get("timeout_seconds", 120)
+    print(f"\n  [TEST] Running: {cmd}")
+
+    result_path = VALIDATIONS_DIR / f"{state['round']}_result.md"
+
+    if dry_run:
+        exit_code = 0
+        result_text = "DRY RUN — validation skipped"
+    else:
+        try:
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True,
+                timeout=timeout, cwd=REPO_ROOT
+            )
+            exit_code = result.returncode
+            result_text = f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
+        except subprocess.TimeoutExpired:
+            exit_code = 1
+            result_text = f"TIMEOUT after {timeout}s"
+
+    status = "VALIDATED" if exit_code == 0 else "FAILED"
+    result_path.write_text(
+        f"# Validation Result — {state['round']}\n"
+        f"TS: {now_iso()}\nExit code: {exit_code}\nStatus: {status}\n\n"
+        f"```\n{result_text}\n```\n"
+    )
+
+    print(f"  [TEST] Exit code: {exit_code} → {status}")
+    append_metric({"round": state["round"], "iter": state["iteration"],
+                    "action": "TEST", "exit_code": exit_code, "status": status})
+
+    state["state"] = status
+    if status == "FAILED":
+        state["last_validation_failure"] = result_text[:500]
+    save_state(state)
+    git_commit(f"{state['round']}_{status}")
 
 # ──────────────────────────────────────────────────────────────────────
 # Human Command Handlers
@@ -706,33 +925,28 @@ def handle_human_command(cmd: str, state: dict, config: dict):
     """Process a human operator command and update state."""
 
     if cmd == "ACCEPT":
-        print("  [HUMAN] Accepted current proposal.")
+        print("  [HUMAN] Accepted.")
         state["state"] = "AGREED"
         state["turn"] = "HUMAN"
         save_state(state)
 
-        # Close round file
         rf = REPO_ROOT / state["round_file"]
         close_round_file(rf)
 
-        # Append summary placeholder to accepted.md
-        append_decision_summary(True, state["round"],
-            f"Accepted at iteration {state['iteration']}. "
-            f"See {state['round_file']} for full discussion.")
-
+        summary = (f"Accepted at iteration {state['iteration']}. "
+                   f"See {state['round_file']} for full discussion.")
+        append_decision_summary(True, state["round"], summary)
+        update_index(state, "AGREED", summary)
         git_commit(f"{state['round']}_HUMAN_APPROVED")
 
     elif cmd == "REJECT":
-        print("  [HUMAN] Rejected. Round re-opens.")
+        print("  [HUMAN] Rejected. Round re-opens with fresh proposals.")
+        append_decision_summary(False, state["round"],
+            f"Rejected at iteration {state['iteration']}. Round re-opened.")
         state["state"] = "DEBATED"
         state["iteration"] = 1
         state["turn"] = "CLAUDE"
         save_state(state)
-
-        append_decision_summary(False, state["round"],
-            f"Rejected at iteration {state['iteration']}. "
-            f"Round re-opened for new proposals.")
-
         git_commit(f"{state['round']}_HUMAN_REJECTED")
 
     elif cmd.startswith("EXTEND"):
@@ -754,11 +968,18 @@ def handle_human_command(cmd: str, state: dict, config: dict):
         rf = REPO_ROOT / state["round_file"]
         close_round_file(rf)
 
-        append_decision_summary(True, state["round"],
-            f"OVERRIDE: Human forced acceptance of {winner}'s proposal. "
-            f"See {state['round_file']} for full discussion.")
-
+        summary = (f"OVERRIDE: Human forced acceptance of {winner}'s proposal. "
+                   f"See {state['round_file']} for full discussion.")
+        append_decision_summary(True, state["round"], summary)
+        update_index(state, "AGREED_OVERRIDE", summary)
         git_commit(f"{state['round']}_HUMAN_OVERRIDE_{winner}")
+
+    elif cmd == "IMPLEMENT":
+        print("  [HUMAN] Triggering implementation phase.")
+        state["state"] = "IMPLEMENT"
+        state["turn"] = "CLAUDE"
+        save_state(state)
+        git_commit(f"{state['round']}_IMPLEMENT_TRIGGERED")
 
     elif cmd == "APPROVE_NEXT_ROUND":
         print("  [HUMAN] Approved advancement to next round.")
@@ -769,6 +990,27 @@ def handle_human_command(cmd: str, state: dict, config: dict):
     elif cmd == "QUIT":
         print("  Exiting orchestrator.")
         sys.exit(0)
+
+# ──────────────────────────────────────────────────────────────────────
+# Stuck-State Detection
+# ──────────────────────────────────────────────────────────────────────
+
+def check_stuck_state(state: dict, config: dict):
+    """Warn if the orchestrator has been in a non-human state too long."""
+    if state["state"] in ("HUMAN_REVIEW", "AGREED", "COMPLETE", "IDLE"):
+        return
+    last_updated = state.get("last_updated")
+    if not last_updated:
+        return
+    timeout_hours = config.get("stuck_state_timeout_hours", 24)
+    try:
+        last_dt = datetime.fromisoformat(last_updated)
+        elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600
+        if elapsed > timeout_hours:
+            print(f"\n  [WARN] Stuck state: '{state['state']}' unchanged for {elapsed:.1f}h "
+                  f"(threshold: {timeout_hours}h). Consider restarting or inspecting state.json.")
+    except (ValueError, TypeError):
+        pass
 
 # ──────────────────────────────────────────────────────────────────────
 # Main Loop
@@ -793,6 +1035,7 @@ def main():
                         help="Title for a new round (used with --resume when starting a new round)")
     args = parser.parse_args()
 
+    ensure_dirs()
     config = load_config()
 
     if args.init:
@@ -816,50 +1059,72 @@ def main():
     while True:
         state = load_state()
         config = load_config()
+        check_stuck_state(state, config)
 
         if state["state"] == "COMPLETE":
             print("\nProject COMPLETE. All rounds finished.")
             break
 
         elif state["state"] == "IDLE":
-            # Need to start a new round
             rid = next_round_id(state["round"])
             title = args.round_title or input(f"Enter title for round {rid}: ").strip()
+            args.round_title = None  # only use once
             if not title:
                 print("Round title required.")
                 continue
 
             rf = create_round_file(rid, title)
             state["round"] = rid
+            state["round_title"] = title
             state["iteration"] = 1
             state["state"] = "DEBATED"
             state["turn"] = "CLAUDE"
             state["max_iterations"] = config.get("max_iterations_default", 3)
             state["round_file"] = str(rf.relative_to(REPO_ROOT))
             state["score_proximity_warning"] = False
+            state.pop("last_validation_failure", None)
             save_state(state)
             git_commit(f"{rid}_opened")
             print(f"\nStarting round {rid}: {title}")
 
         elif state["state"] in ("DEBATED", "PROPOSED"):
-            # Run a debate iteration
             run_debate_iteration(state, config, dry_run=args.dry_run)
 
         elif state["state"] == "SCORED":
-            # After scoring, go to human review
+            # Resuming after an interrupted iteration — go to HUMAN_REVIEW
             state["turn"] = "HUMAN"
             state["state"] = "HUMAN_REVIEW"
             save_state(state)
 
-        elif state["state"] in ("HUMAN_REVIEW", "DEADLOCKED"):
+        elif state["state"] in ("SYNTHESIZED", "HUMAN_REVIEW", "DEADLOCKED"):
             cmd = prompt_human_review(state)
             handle_human_command(cmd, state, config)
 
         elif state["state"] == "AGREED":
-            # Round is done, wait for APPROVE_NEXT_ROUND
-            print(f"\nRound {state['round']} AGREED. Issue APPROVE_NEXT_ROUND to continue.")
+            print(f"\nRound {state['round']} AGREED.")
+            print(f"  Read: {state.get('round_file')}")
             cmd = prompt_human_review(state)
             handle_human_command(cmd, state, config)
+
+        elif state["state"] == "IMPLEMENT":
+            run_implement_turn(state, config, dry_run=args.dry_run)
+
+        elif state["state"] == "TEST":
+            run_test_phase(state, config, dry_run=args.dry_run)
+
+        elif state["state"] == "VALIDATED":
+            print(f"\nRound {state['round']} VALIDATED.")
+            cmd = prompt_human_review(state)
+            handle_human_command(cmd, state, config)
+
+        elif state["state"] == "FAILED":
+            print(f"\nRound {state['round']} FAILED validation.")
+            print(f"  Failure context injected into next debate iteration.")
+            state["state"] = "DEBATED"
+            state["iteration"] = 1
+            state["turn"] = "CLAUDE"
+            save_state(state)
+            git_commit(f"{state['round']}_FAILED_REOPENED")
 
         else:
             print(f"Unknown state: {state['state']}")
