@@ -30,6 +30,7 @@ VALIDATIONS_DIR = REPO_ROOT / "collaboration" / "validations"
 COMPROMISE_DIR = REPO_ROOT / "collaboration" / "compromise"
 INDEX_FILE = REPO_ROOT / "collaboration" / "index.yaml"
 METRICS_FILE = REPO_ROOT / "metrics.jsonl"
+SPEC_FILE = REPO_ROOT / "collaboration" / "spec.md"
 
 VALID_STATES = [
     "IDLE",
@@ -40,10 +41,19 @@ VALID_STATES = [
     "AGREED",
     "DEADLOCKED",
     "HUMAN_REVIEW",
+    # Legacy design-loop implementation states
     "IMPLEMENT",
     "TEST",
     "VALIDATED",
     "FAILED",
+    # Full SDLC build pipeline states
+    "SPEC",
+    "SPEC_READY",
+    "BUILD",
+    "CODE_REVIEW",
+    "CODE_REVIEWED",
+    "QA_WRITE",
+    "QA_FAILED",
     "COMPLETE",
 ]
 VALID_TURNS = ["CLAUDE", "CODEX", "HUMAN"]
@@ -63,6 +73,7 @@ def ensure_dirs():
         CALIBRATION_DIR,
         VALIDATIONS_DIR,
         COMPROMISE_DIR,
+        SPEC_FILE.parent,
     ]:
         d.mkdir(parents=True, exist_ok=True)
 
@@ -539,7 +550,10 @@ def prompt_human_review(state: dict) -> str:
     print("  EXTEND +N             — Grant N more iterations before deadlock")
     print("  OVERRIDE CLAUDE|CODEX — Force-accept one LLM's proposal")
     if state["state"] == "AGREED":
-        print("  IMPLEMENT             — Generate implementation artifacts for this round")
+        print("  IMPLEMENT             — Generate implementation artifacts (legacy)")
+        print("  BEGIN_BUILD           — Start full SDLC pipeline (SPEC → BUILD → QA)")
+    if state["state"] == "SPEC_READY":
+        print("  BEGIN_BUILD           — Approve spec and start Codex build phase")
     print("  APPROVE_NEXT_ROUND    — Advance to next round")
     print("  QUIT                  — Exit orchestrator")
     print()
@@ -555,7 +569,7 @@ def prompt_human_review(state: dict) -> str:
             continue
 
         upper = cmd.upper()
-        if upper in ("ACCEPT", "REJECT", "QUIT", "APPROVE_NEXT_ROUND", "IMPLEMENT"):
+        if upper in ("ACCEPT", "REJECT", "QUIT", "APPROVE_NEXT_ROUND", "IMPLEMENT", "BEGIN_BUILD"):
             return upper
         if upper.startswith("EXTEND"):
             parts = upper.split()
@@ -1007,8 +1021,8 @@ def run_implement_turn(state: dict, config: dict, dry_run: bool = False):
     print("  [IMPLEMENT] Done. Running validation...")
 
 
-def run_test_phase(state: dict, config: dict, dry_run: bool = False):
-    """Run the configured validation command and transition to VALIDATED or FAILED."""
+def run_test_phase(state: dict, config: dict, dry_run: bool = False, fail_state: str = "FAILED"):
+    """Run the configured validation command and transition to VALIDATED or fail_state."""
     validation = config.get("validation", {})
     cmd = validation.get("command")
 
@@ -1037,7 +1051,7 @@ def run_test_phase(state: dict, config: dict, dry_run: bool = False):
             exit_code = 1
             result_text = f"TIMEOUT after {timeout}s"
 
-    status = "VALIDATED" if exit_code == 0 else "FAILED"
+    status = "VALIDATED" if exit_code == 0 else fail_state
     result_path.write_text(
         f"# Validation Result — {state['round']}\n"
         f"TS: {now_iso()}\nExit code: {exit_code}\nStatus: {status}\n\n"
@@ -1132,6 +1146,14 @@ def handle_human_command(cmd: str, state: dict, config: dict):
         save_state(state)
         git_commit(f"{state['round']}_IMPLEMENT_TRIGGERED")
 
+    elif cmd == "BEGIN_BUILD":
+        print("  [HUMAN] Starting full SDLC build pipeline.")
+        state["state"] = "SPEC"
+        state["turn"] = "CLAUDE"
+        state["build_iteration"] = 1
+        save_state(state)
+        git_commit(f"{state['round']}_BUILD_PIPELINE_STARTED")
+
     elif cmd == "APPROVE_NEXT_ROUND":
         print("  [HUMAN] Approved advancement to next round.")
         state["state"] = "IDLE"
@@ -1166,6 +1188,269 @@ def check_stuck_state(state: dict, config: dict):
             )
     except (ValueError, TypeError):
         pass
+
+
+# ──────────────────────────────────────────────────────────────────────
+# SDLC Pipeline — Spec, Build, Review, QA
+# ──────────────────────────────────────────────────────────────────────
+
+
+def should_pause_for_human(state_name: str, config: dict) -> bool:
+    """Return True if this state is a configured human gate."""
+    default_gates = ["SPEC_READY", "VALIDATED"]
+    gates = config.get("human_gates", default_gates)
+    return state_name in gates
+
+
+def run_spec_phase(state: dict, config: dict, dry_run: bool = False):
+    """
+    CLAUDE writes an implementation specification to collaboration/spec.md.
+    Covers: file layout, interfaces, key algorithms, error handling, test strategy.
+    """
+    print("\n  [SPEC] CLAUDE writing implementation spec...")
+    sys_prompt = build_system_prompt("CLAUDE", state, config)
+
+    accepted_path = DECISIONS_DIR / "accepted.md"
+    accepted_text = accepted_path.read_text() if accepted_path.exists() else "(none)"
+
+    prompt = (
+        "You are the Spec Writer. Based on the accepted design decisions, write a complete "
+        "implementation specification that a developer can follow without ambiguity.\n\n"
+        f"== ACCEPTED DECISIONS ==\n{accepted_text}\n\n"
+        "Your spec MUST include ALL of these sections:\n\n"
+        "## Overview\n"
+        "One paragraph describing what will be built and why.\n\n"
+        "## File Layout\n"
+        "Exact directory tree of all files to create or modify.\n\n"
+        "## Interfaces & Data Structures\n"
+        "Public APIs, class signatures, function signatures with types. Use code blocks.\n\n"
+        "## Key Algorithms\n"
+        "Pseudocode or step-by-step logic for non-trivial algorithms.\n\n"
+        "## Error Handling\n"
+        "Failure modes and expected behavior for each.\n\n"
+        "## Test Strategy\n"
+        "What unit/integration tests must pass. List at least 5 concrete test cases.\n\n"
+        "## Acceptance Criteria\n"
+        "Numbered list of conditions that define DONE.\n\n"
+        "Be precise — the developer will have no other requirements document."
+    )
+
+    t0 = time.time()
+    output = invoke_llm("CLAUDE", prompt, sys_prompt, dry_run)
+    duration = round(time.time() - t0, 2)
+
+    spec_content = (
+        f"# Implementation Spec — {state['round']}\n"
+        f"Generated: {now_iso()} | Round: {state['round']}\n\n---\n\n{output}\n"
+    )
+    SPEC_FILE.write_text(spec_content)
+
+    append_metric(
+        {
+            "round": state["round"],
+            "iter": state["iteration"],
+            "llm": "CLAUDE",
+            "action": "SPEC",
+            "duration_s": duration,
+            "output_len": len(output),
+        }
+    )
+
+    state["state"] = "SPEC_READY"
+    state["turn"] = "HUMAN" if should_pause_for_human("SPEC_READY", config) else "CODEX"
+    save_state(state)
+    git_commit(f"{state['round']}_SPEC_WRITTEN")
+    print(f"  [SPEC] Written to {SPEC_FILE.relative_to(REPO_ROOT)}")
+
+
+def run_build_phase(state: dict, config: dict, dry_run: bool = False):
+    """
+    Codex (--full-auto) reads the spec and builds implementation files under src/.
+    Codex writes files directly to disk via its agent loop — no text blob return.
+    Loops up to max_build_iterations if tests fail after code review.
+    """
+    build_iter = state.get("build_iteration", 1)
+    max_build = config.get("max_build_iterations", 3)
+    print(f"\n  [BUILD] CODEX building (iteration {build_iter}/{max_build})...")
+
+    spec_text = SPEC_FILE.read_text() if SPEC_FILE.exists() else "(no spec found)"
+
+    review_context = ""
+    review_path = VALIDATIONS_DIR / f"{state['round']}_code_review.md"
+    if review_path.exists():
+        review_context = f"\n\n== PRIOR CODE REVIEW FEEDBACK ==\n{review_path.read_text()}"
+
+    sys_prompt = (
+        f"You are the Developer implementing a spec for the LLM collaboration project.\n"
+        f"Project root: {REPO_ROOT}\n"
+        f"Write all source files under src/. Follow the spec exactly.\n"
+        f"After writing all files, output a short ## Build Summary listing files created/modified."
+    )
+
+    prompt = (
+        f"Implement the following specification.\n\n"
+        f"{spec_text}"
+        f"{review_context}\n\n"
+        f"Rules:\n"
+        f"- Write all source files under src/\n"
+        f"- Follow the File Layout section exactly\n"
+        f"- Implement every interface in the Interfaces section\n"
+        f"- Do not skip error handling\n"
+        f"- When done, output a ## Build Summary with each file path and one-line description"
+    )
+
+    t0 = time.time()
+    output = invoke_llm("CODEX", prompt, sys_prompt, dry_run)
+    duration = round(time.time() - t0, 2)
+
+    build_log = VALIDATIONS_DIR / f"{state['round']}_build_{build_iter}.md"
+    build_log.write_text(
+        f"# Build Log — {state['round']} iter {build_iter}\nTS: {now_iso()}\n\n{output}\n"
+    )
+
+    append_metric(
+        {
+            "round": state["round"],
+            "build_iter": build_iter,
+            "llm": "CODEX",
+            "action": "BUILD",
+            "duration_s": duration,
+            "output_len": len(output),
+        }
+    )
+
+    state["state"] = "CODE_REVIEW"
+    state["turn"] = "CLAUDE"
+    state["build_iteration"] = build_iter
+    save_state(state)
+    git_commit(f"{state['round']}_BUILD_iter{build_iter}")
+    print(f"  [BUILD] Done. Logged to {build_log.relative_to(REPO_ROOT)}")
+
+
+def run_code_review_phase(state: dict, config: dict, dry_run: bool = False):
+    """
+    CLAUDE reviews the built code against the spec.
+    APPROVED → CODE_REVIEWED → QA_WRITE
+    REWORK   → back to BUILD (up to max_build_iterations)
+    """
+    print("\n  [CODE_REVIEW] CLAUDE reviewing code...")
+    sys_prompt = build_system_prompt("CLAUDE", state, config)
+
+    spec_text = SPEC_FILE.read_text() if SPEC_FILE.exists() else "(no spec)"
+    build_iter = state.get("build_iteration", 1)
+    build_log_path = VALIDATIONS_DIR / f"{state['round']}_build_{build_iter}.md"
+    build_summary = build_log_path.read_text() if build_log_path.exists() else "(no build log)"
+
+    prompt = (
+        "You are the Code Reviewer. Review the implementation against the spec.\n\n"
+        f"== SPEC ==\n{spec_text}\n\n"
+        f"== BUILD SUMMARY ==\n{build_summary}\n\n"
+        "Also examine the files written under src/.\n\n"
+        "Your review MUST include:\n\n"
+        "## Verdict\n"
+        "First line: either `APPROVED` or `REWORK REQUIRED`\n\n"
+        "## Spec Compliance\n"
+        "Check each Acceptance Criterion — PASS or FAIL with reason.\n\n"
+        "## Code Quality\n"
+        "- Correctness issues (bugs, off-by-one, missing edge cases)\n"
+        "- Missing error handling per spec\n"
+        "- Interface mismatches\n\n"
+        "## Rework Instructions (if REWORK REQUIRED)\n"
+        "Numbered list of specific changes needed. Be precise enough for Codex to act on.\n\n"
+        "If all Acceptance Criteria pass and no critical bugs: verdict is APPROVED."
+    )
+
+    t0 = time.time()
+    output = invoke_llm("CLAUDE", prompt, sys_prompt, dry_run)
+    duration = round(time.time() - t0, 2)
+
+    review_path = VALIDATIONS_DIR / f"{state['round']}_code_review.md"
+    review_path.write_text(
+        f"# Code Review — {state['round']} build iter {build_iter}\nTS: {now_iso()}\n\n{output}\n"
+    )
+
+    append_metric(
+        {
+            "round": state["round"],
+            "build_iter": build_iter,
+            "llm": "CLAUDE",
+            "action": "CODE_REVIEW",
+            "duration_s": duration,
+            "output_len": len(output),
+        }
+    )
+
+    approved = "APPROVED" in output.upper().split("\n")[0:5]  # check first 5 lines for verdict
+    max_build = config.get("max_build_iterations", 3)
+
+    if approved:
+        print("  [CODE_REVIEW] APPROVED → QA_WRITE")
+        state["state"] = "CODE_REVIEWED"
+        state["turn"] = "CLAUDE"
+        save_state(state)
+        git_commit(f"{state['round']}_CODE_REVIEW_APPROVED")
+    elif build_iter < max_build:
+        print(f"  [CODE_REVIEW] REWORK REQUIRED → BUILD iter {build_iter + 1}")
+        state["state"] = "BUILD"
+        state["turn"] = "CODEX"
+        state["build_iteration"] = build_iter + 1
+        save_state(state)
+        git_commit(f"{state['round']}_CODE_REVIEW_REWORK_{build_iter}")
+    else:
+        print(f"  [CODE_REVIEW] REWORK REQUIRED but max build iterations ({max_build}) reached.")
+        print("  Advancing to QA with warnings — human review recommended.")
+        state["state"] = "CODE_REVIEWED"
+        state["turn"] = "CLAUDE"
+        save_state(state)
+        git_commit(f"{state['round']}_CODE_REVIEW_MAX_ITER")
+
+
+def run_qa_write_phase(state: dict, config: dict, dry_run: bool = False):
+    """
+    CLAUDE writes the test suite based on the spec's Test Strategy section.
+    Places tests under tests/. Transitions to TEST.
+    """
+    print("\n  [QA_WRITE] CLAUDE writing test suite...")
+    sys_prompt = build_system_prompt("CLAUDE", state, config)
+
+    spec_text = SPEC_FILE.read_text() if SPEC_FILE.exists() else "(no spec)"
+
+    prompt = (
+        "You are the QA Engineer. Write a comprehensive test suite based on the spec.\n\n"
+        f"== SPEC ==\n{spec_text}\n\n"
+        "Rules:\n"
+        "- Write all test files under tests/\n"
+        "- Cover every Acceptance Criterion with at least one test\n"
+        "- Cover every interface function/method with unit tests\n"
+        "- Include at least 2 integration tests\n"
+        "- Include edge case and failure mode tests\n"
+        "- Use pytest conventions (test_ prefix, assert statements)\n"
+        "- After writing all test files, output a ## Test Manifest "
+        "listing each file and the scenarios it covers"
+    )
+
+    t0 = time.time()
+    output = invoke_llm("CLAUDE", prompt, sys_prompt, dry_run)
+    duration = round(time.time() - t0, 2)
+
+    qa_log = VALIDATIONS_DIR / f"{state['round']}_qa_written.md"
+    qa_log.write_text(f"# QA Write Log — {state['round']}\nTS: {now_iso()}\n\n{output}\n")
+
+    append_metric(
+        {
+            "round": state["round"],
+            "llm": "CLAUDE",
+            "action": "QA_WRITE",
+            "duration_s": duration,
+            "output_len": len(output),
+        }
+    )
+
+    state["state"] = "TEST"
+    state["turn"] = "HUMAN"
+    save_state(state)
+    git_commit(f"{state['round']}_QA_WRITTEN")
+    print(f"  [QA_WRITE] Done. Log: {qa_log.relative_to(REPO_ROOT)}")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1275,12 +1560,19 @@ def main():
             run_implement_turn(state, config, dry_run=args.dry_run)
 
         elif state["state"] == "TEST":
-            run_test_phase(state, config, dry_run=args.dry_run)
+            # Detect context: came from QA_WRITE (SDLC) or IMPLEMENT (legacy)
+            in_sdlc = state.get("build_iteration") is not None
+            fail_state = "QA_FAILED" if in_sdlc else "FAILED"
+            run_test_phase(state, config, dry_run=args.dry_run, fail_state=fail_state)
 
         elif state["state"] == "VALIDATED":
             print(f"\nRound {state['round']} VALIDATED.")
-            cmd = prompt_human_review(state)
-            handle_human_command(cmd, state, config)
+            if should_pause_for_human("VALIDATED", config):
+                cmd = prompt_human_review(state)
+                handle_human_command(cmd, state, config)
+            else:
+                state["state"] = "IDLE"
+                save_state(state)
 
         elif state["state"] == "FAILED":
             print(f"\nRound {state['round']} FAILED validation.")
@@ -1290,6 +1582,54 @@ def main():
             state["turn"] = "CLAUDE"
             save_state(state)
             git_commit(f"{state['round']}_FAILED_REOPENED")
+
+        # ── Full SDLC states ──────────────────────────────────────────
+
+        elif state["state"] == "SPEC":
+            run_spec_phase(state, config, dry_run=args.dry_run)
+
+        elif state["state"] == "SPEC_READY":
+            if should_pause_for_human("SPEC_READY", config):
+                print(
+                    f"\nSpec ready for round {state['round']}. Review: {SPEC_FILE.relative_to(REPO_ROOT)}"
+                )
+                cmd = prompt_human_review(state)
+                handle_human_command(cmd, state, config)
+            else:
+                # Auto-advance: start build
+                state["state"] = "BUILD"
+                state["turn"] = "CODEX"
+                state["build_iteration"] = 1
+                save_state(state)
+
+        elif state["state"] == "BUILD":
+            run_build_phase(state, config, dry_run=args.dry_run)
+
+        elif state["state"] == "CODE_REVIEW":
+            run_code_review_phase(state, config, dry_run=args.dry_run)
+
+        elif state["state"] == "CODE_REVIEWED":
+            run_qa_write_phase(state, config, dry_run=args.dry_run)
+
+        elif state["state"] == "QA_WRITE":
+            run_qa_write_phase(state, config, dry_run=args.dry_run)
+
+        elif state["state"] == "QA_FAILED":
+            print(f"\nRound {state['round']} QA FAILED.")
+            build_iter = state.get("build_iteration", 1)
+            max_build = config.get("max_build_iterations", 3)
+            if build_iter < max_build:
+                print(f"  Reopening build phase (iter {build_iter + 1}/{max_build}).")
+                state["state"] = "BUILD"
+                state["turn"] = "CODEX"
+                state["build_iteration"] = build_iter + 1
+                save_state(state)
+                git_commit(f"{state['round']}_QA_FAILED_REBUILD_{build_iter + 1}")
+            else:
+                print(f"  Max build iterations ({max_build}) reached. Human review required.")
+                state["state"] = "HUMAN_REVIEW"
+                state["turn"] = "HUMAN"
+                save_state(state)
 
         else:
             print(f"Unknown state: {state['state']}")

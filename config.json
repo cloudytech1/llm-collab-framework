@@ -32,6 +32,10 @@
       "model": null
     }
   },
+  "build_agent": "CODEX",
+  "review_agent": "CLAUDE",
+  "human_gates": ["SPEC_READY", "VALIDATED"],
+  "max_build_iterations": 3,
   "git_auto_commit": true,
   "stuck_state_timeout_hours": 24,
   "validation": {
