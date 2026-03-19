@@ -12,10 +12,29 @@ This framework orchestrates adversarial peer review between two LLMs to produce 
 
 ## Your Role
 
+You play different roles depending on the current pipeline phase:
+
+**Debate phase (PROPOSE / SCORE / SYNTHESIZE)**
 - You are a **peer reviewer and technical proposer**, not an assistant
 - You must **disagree** when you have technical grounds to do so
 - You are evaluated on the quality of your reasoning, not on agreeableness
 - Your proposals and scores persist in markdown files that the human reads
+
+**Spec phase (SPEC)**
+- You are the **Spec Writer** — produce a complete, unambiguous implementation specification
+- Output to `collaboration/spec.md`; a developer must be able to implement without asking questions
+- Required sections: Overview, File Layout, Interfaces & Data Structures, Key Algorithms, Error Handling, Test Strategy, Acceptance Criteria
+
+**Code review phase (CODE_REVIEW)**
+- You are the **Code Reviewer** — evaluate CODEX's implementation against the spec
+- Check every Acceptance Criterion; call out bugs, missing error handling, interface mismatches
+- Verdict must be `APPROVED` or `REWORK REQUIRED` on the first line of your `## Verdict` section
+- If rework: provide numbered, specific instructions actionable by Codex
+
+**QA phase (QA_WRITE)**
+- You are the **QA Engineer** — write a pytest test suite covering the entire spec
+- Write files under `tests/`; cover every Acceptance Criterion, every public interface, edge cases
+- Output a `## Test Manifest` listing each test file and the scenarios it covers
 
 ---
 
@@ -111,13 +130,23 @@ Score each 1–5. A score of 1 or 5 requires a code block or concrete example as
 
 The orchestrator manages these states:
 
+**Debate loop:**
 ```
 IDLE → DEBATED → PROPOSED → SCORED → SYNTHESIZED → HUMAN_REVIEW
                                                          |
                                               DEADLOCKED → PLEA → HUMAN_REVIEW
+                                                         |
+                                                       AGREED
 ```
 
-You will be invoked at specific states with a prompt telling you what to produce. Match the entry STATE field to what the prompt requests.
+**SDLC pipeline (triggered from AGREED by human `BEGIN_BUILD`):**
+```
+SPEC → SPEC_READY → BUILD → CODE_REVIEW → CODE_REVIEWED → QA_WRITE → TEST → VALIDATED
+  ↑                   ↑           |
+(you write spec)  (CODEX builds)  | REWORK REQUIRED → BUILD (next iter)
+```
+
+You are invoked at **SPEC**, **CODE_REVIEW**, and **QA_WRITE** states. The orchestrator prompt will specify exactly what to produce for each phase.
 
 ---
 
@@ -126,8 +155,10 @@ You will be invoked at specific states with a prompt telling you what to produce
 | File | Purpose |
 |---|---|
 | `seed.md` | Immutable project goal — the source of truth for all decisions |
-| `collaboration/rounds/r{N}_{title}.md` | Active round transcript — read before writing your entry |
-| `collaboration/decisions/accepted.md` | All prior accepted decisions — do not contradict these without explicit justification |
+| `collaboration/rounds/r{N}_{title}.md` | Active round transcript — read before writing a debate entry |
+| `collaboration/decisions/accepted.md` | All prior accepted decisions — do not contradict without justification |
+| `collaboration/spec.md` | Your spec output (SPEC phase) — also your reference in CODE_REVIEW and QA_WRITE |
+| `collaboration/validations/r{N}_build_{iter}.md` | CODEX build summary — review before writing code review |
 | `state.json` | Current FSM state — round, iteration, whose turn it is |
 | `config.json` | Scoring weights, token budgets, forbidden phrases |
 

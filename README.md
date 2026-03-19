@@ -31,6 +31,7 @@ The system enforces structured disagreement as a first-class mechanism. LLMs are
 - Git-backed audit trail of all LLM outputs and human decisions
 - Dry-run mode for testing without real CLI calls
 - Observability via append-only metrics log
+- Full SDLC pipeline: CLAUDE authors spec → CODEX builds → CLAUDE reviews → CLAUDE writes tests → automated validation
 
 ### Out of scope
 
@@ -43,6 +44,8 @@ The system enforces structured disagreement as a first-class mechanism. LLMs are
 ---
 
 ## State Machine
+
+### Debate Loop
 
 ```
 IDLE
@@ -77,33 +80,63 @@ HUMAN_REVIEW       DEADLOCKED                       |
   v                                                 |
 AGREED                              REJECT ---------+
   |
-  | (LLM generates artifacts)
+  | BEGIN_BUILD (triggers SDLC pipeline)
   v
-IMPLEMENT
+  (see SDLC Pipeline below)
+```
+
+### SDLC Pipeline
+
+Triggered from `AGREED` by the human issuing `BEGIN_BUILD`.
+
+```
+AGREED
   |
-  | (validation_command runs)
+  | BEGIN_BUILD
   v
-TEST
-  |               |
-  | (exit 0)      | (exit non-zero)
-  v               v
-VALIDATED       FAILED
-  |               |
-  v               | (failure context injected)
- IDLE             +-----------> DEBATED
+SPEC   ← CLAUDE writes implementation spec to collaboration/spec.md
+  |
+  v
+SPEC_READY  ← [human gate: review spec, issue BEGIN_BUILD to proceed]
+  |
+  v
+BUILD  ← CODEX (--full-auto) implements spec, writes files under src/
+  |
+  v
+CODE_REVIEW  ← CLAUDE reviews code against spec
+  |                    |
+  | APPROVED           | REWORK REQUIRED (up to max_build_iterations)
+  v                    v
+CODE_REVIEWED       BUILD (next iteration)
+  |
+  v
+QA_WRITE  ← CLAUDE writes pytest test suite to tests/
+  |
+  v
+TEST  ← validation.command runs
+  |                    |
+  | exit 0             | exit non-zero
+  v                    v
+VALIDATED           QA_FAILED ← loops back to BUILD (or human review at max)
+  |
+  | [human gate]
+  v
+IDLE (next round)
 ```
 
 ### Human commands
 
-| Command             | Effect                                              |
-|---------------------|-----------------------------------------------------|
-| `ACCEPT`            | Accept current proposal; advance to IMPLEMENT       |
-| `REJECT`            | Reject; round resets to DEBATED, iteration 1        |
-| `EXTEND +N`         | Grant N additional iterations before DEADLOCK       |
-| `OVERRIDE CLAUDE`   | Force-accept CLAUDE's proposal                      |
-| `OVERRIDE CODEX`    | Force-accept CODEX's proposal                       |
-| `APPROVE_NEXT_ROUND`| Advance from AGREED/VALIDATED to next round (IDLE)  |
-| `QUIT`              | Exit the orchestrator                               |
+| Command             | Effect                                                        |
+|---------------------|---------------------------------------------------------------|
+| `ACCEPT`            | Accept current proposal; advance to AGREED                    |
+| `REJECT`            | Reject; round resets to DEBATED, iteration 1                  |
+| `EXTEND +N`         | Grant N additional iterations before DEADLOCK                 |
+| `OVERRIDE CLAUDE`   | Force-accept CLAUDE's proposal                                |
+| `OVERRIDE CODEX`    | Force-accept CODEX's proposal                                 |
+| `BEGIN_BUILD`       | From AGREED or SPEC_READY: start/continue the SDLC pipeline   |
+| `IMPLEMENT`         | Legacy: CLAUDE generates implementation artifacts directly     |
+| `APPROVE_NEXT_ROUND`| Advance from AGREED/VALIDATED to next round (IDLE)            |
+| `QUIT`              | Exit the orchestrator                                         |
 
 ---
 
@@ -118,15 +151,22 @@ llm-collab-framework/
 ├── state.lock                           # Write lock (deleted when not held)
 ├── metrics.jsonl                        # Append-only per-turn instrumentation
 │
+├── src/                                 # Implementation files (written by CODEX during BUILD)
+├── tests/                               # Test suite (written by CLAUDE during QA_WRITE)
+│
 ├── calibration/
 │   └── scoring_examples.md              # Anchor examples injected into scoring prompts
 │
 └── collaboration/
     ├── index.yaml                        # Lightweight round index for context retrieval
+    ├── spec.md                           # Implementation spec (written by CLAUDE during SPEC)
     ├── rounds/
     │   └── r{N}_{title}.md              # Full debate transcript per round
     ├── validations/
-    │   └── r{N}_result.md               # VALIDATE phase output (stdout/stderr + exit code)
+    │   ├── r{N}_result.md               # TEST phase output (stdout/stderr + exit code)
+    │   ├── r{N}_build_{iter}.md         # CODEX build log per iteration
+    │   ├── r{N}_code_review.md          # CLAUDE code review output
+    │   └── r{N}_qa_written.md           # QA_WRITE phase log
     ├── pleas/
     │   └── r{N}_plea_{LLM}.md           # DEADLOCK plea files
     ├── compromise/
@@ -228,8 +268,12 @@ TS: 2026-03-19T04:15:23Z
     "I agree", "great point", "you're right", "exactly",
     "well said", "good idea", "nice approach", "that makes sense"
   ],
+  "build_agent": "CODEX",
+  "review_agent": "CLAUDE",
+  "human_gates": ["SPEC_READY", "VALIDATED"],
+  "max_build_iterations": 3,
   "validation": {
-    "command": "bash validate.sh",
+    "command": null,
     "timeout_seconds": 120,
     "on_failure": "reopen_round"
   },
@@ -238,17 +282,27 @@ TS: 2026-03-19T04:15:23Z
   "cli": {
     "claude": {
       "command": "claude",
-      "flags": ["-p", "--output-format", "text", "--max-turns", "1"],
+      "flags": ["-p", "--output-format", "text", "--max-turns", "1", "--dangerously-skip-permissions"],
       "model": null
     },
     "codex": {
       "command": "codex",
-      "flags": ["--quiet", "--full-auto"],
+      "flags": ["--quiet", "--full-auto", "--dangerously-bypass-approvals-and-sandbox"],
       "model": null
     }
   }
 }
 ```
+
+**Key config fields:**
+
+| Field | Default | Description |
+|---|---|---|
+| `human_gates` | `["SPEC_READY", "VALIDATED"]` | States that pause for human review in the SDLC pipeline |
+| `max_build_iterations` | `3` | Max CODEX build attempts before escalating to human |
+| `build_agent` | `"CODEX"` | LLM that runs the BUILD phase |
+| `review_agent` | `"CLAUDE"` | LLM that runs CODE_REVIEW and QA_WRITE |
+| `validation.command` | `null` | Shell command to run in TEST phase; null skips to VALIDATED |
 
 ---
 
@@ -317,11 +371,25 @@ To pre-specify the round title (useful for scripting):
 python orchestrator.py --resume --round-title "api_design"
 ```
 
-### 7. Deadlock handling
+### 7. Start the build pipeline
+
+Once a round is `AGREED`, issue `BEGIN_BUILD` at the `>>>` prompt to enter the SDLC pipeline:
+
+1. **SPEC** — CLAUDE writes a detailed implementation spec to `collaboration/spec.md`
+2. **SPEC_READY** — Human gate (default). Review the spec, then issue `BEGIN_BUILD` to approve it and start CODEX
+3. **BUILD** — CODEX (`--full-auto`) reads the spec and writes implementation files to `src/`
+4. **CODE_REVIEW** — CLAUDE reviews the code against the spec, either approving or requesting rework
+5. **QA_WRITE** — CLAUDE writes a pytest test suite to `tests/`
+6. **TEST** — `validation.command` runs; exit 0 → VALIDATED, non-zero → QA_FAILED (rebuild loop)
+7. **VALIDATED** — Human gate (default). Issue `APPROVE_NEXT_ROUND` to advance to IDLE
+
+To skip human gates, remove the state from `human_gates` in config.json.
+
+### 8. Deadlock handling
 
 If `max_iterations` is exceeded, the system enters DEADLOCK. Both LLMs write plea files to `collaboration/pleas/`. The orchestrator also generates a `compromise_template.md` in `collaboration/compromise/` listing the specific contested decisions as structured choices. Fill it out at the `>>>` prompt or edit the file and issue `ACCEPT`.
 
-### 8. Monitor progress
+### 9. Monitor progress
 
 All state is in `state.json`. Full history is in git log. Per-turn metrics (duration, scores, token counts where available) are appended to `metrics.jsonl`.
 
@@ -362,9 +430,24 @@ These are enforced in the system prompt and checked by the orchestrator:
 
 ---
 
+## LLM Roles Summary
+
+| Phase | Role | Agent | Output |
+|---|---|---|---|
+| PROPOSE | Technical proposer | CLAUDE, CODEX | Round file entry |
+| SCORE | Peer reviewer | CLAUDE, CODEX | Scored round file entry |
+| SYNTHESIZE | Merger | Lower-scoring LLM | Merged design entry |
+| SPEC | Spec writer | CLAUDE | `collaboration/spec.md` |
+| BUILD | Developer | CODEX | `src/` implementation files |
+| CODE_REVIEW | Code reviewer | CLAUDE | `collaboration/validations/r{N}_code_review.md` |
+| QA_WRITE | QA engineer | CLAUDE | `tests/` pytest suite |
+| TEST | Validator | Shell | `collaboration/validations/r{N}_result.md` |
+
+---
+
 ## Known Limitations
 
 - **Score reliability.** LLM scoring is subjective and can drift across rounds. Calibration examples reduce variance but do not eliminate it. Cross-round normalization is not implemented.
-- **Two-agent only.** The core debate loop assumes exactly two agents. Role specialization (Architect, Implementer, Validator) is architecturally possible as phase-specific agents but is not currently implemented.
 - **Codex system prompt injection.** The Codex CLI does not support a dedicated `--system-prompt` flag; system instructions are prepended to the user prompt. This is less reliable than Claude's native system prompt handling.
 - **No automatic agreement detection.** The orchestrator does not parse verdicts to detect when both LLMs reach the same conclusion independently. Every round goes to `HUMAN_REVIEW` regardless.
+- **Build coverage.** Codex `--full-auto` writes files directly to disk during its internal loop. The orchestrator captures a summary but does not enumerate or validate individual files written.

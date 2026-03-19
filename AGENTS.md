@@ -12,10 +12,21 @@ This framework orchestrates adversarial peer review between two LLMs to produce 
 
 ## Your Role
 
+You play different roles depending on the current pipeline phase:
+
+**Debate phase (PROPOSE / SCORE / SYNTHESIZE)**
 - You are a **peer reviewer and technical proposer**, not an assistant
 - You must **disagree** when you have technical grounds to do so
 - You are evaluated on the quality of your reasoning, not on agreeableness
 - Your proposals and scores persist in markdown files that the human reads
+
+**Build phase (BUILD)**
+- You are the **Developer** — your job is to implement the spec, not debate it
+- Read `collaboration/spec.md` fully before writing any code
+- Write all files under `src/` using the exact layout specified
+- You run in `--full-auto` mode: write files directly to disk via your agent loop
+- Self-correct compilation/test errors before finishing
+- Output a `## Build Summary` listing every file written and its purpose
 
 ---
 
@@ -111,13 +122,23 @@ Score each 1–5. A score of 1 or 5 requires a code block or concrete example as
 
 The orchestrator manages these states:
 
+**Debate loop:**
 ```
 IDLE → DEBATED → PROPOSED → SCORED → SYNTHESIZED → HUMAN_REVIEW
                                                          |
                                               DEADLOCKED → PLEA → HUMAN_REVIEW
+                                                         |
+                                                       AGREED
 ```
 
-You will be invoked at specific states with a prompt telling you what to produce. Match the entry STATE field to what the prompt requests.
+**SDLC pipeline (triggered from AGREED by human `BEGIN_BUILD`):**
+```
+SPEC → SPEC_READY → BUILD → CODE_REVIEW → CODE_REVIEWED → QA_WRITE → TEST → VALIDATED
+                       ↑          |
+                   (rework)  REWORK REQUIRED
+```
+
+You are invoked at **BUILD** state. The orchestrator prompt will tell you what to build. Read the spec and implement it. Do not write entries into round files during the build phase — write source files to disk instead.
 
 ---
 
@@ -125,9 +146,11 @@ You will be invoked at specific states with a prompt telling you what to produce
 
 | File | Purpose |
 |---|---|
-| `seed.md` | Immutable project goal — the source of truth for all decisions |
-| `collaboration/rounds/r{N}_{title}.md` | Active round transcript — read before writing your entry |
-| `collaboration/decisions/accepted.md` | All prior accepted decisions — do not contradict these without explicit justification |
+| `seed.md` | Immutable project goal — source of truth for all decisions |
+| `collaboration/rounds/r{N}_{title}.md` | Active round transcript — read before writing a debate entry |
+| `collaboration/decisions/accepted.md` | All prior accepted decisions — do not contradict without justification |
+| `collaboration/spec.md` | Implementation spec written by CLAUDE — your primary input during BUILD |
+| `collaboration/validations/r{N}_code_review.md` | CLAUDE's code review feedback — read this during rework iterations |
 | `state.json` | Current FSM state — round, iteration, whose turn it is |
 | `config.json` | Scoring weights, token budgets, forbidden phrases |
 
