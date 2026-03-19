@@ -1,13 +1,14 @@
 {
   "project": "",
-  "round": "r00",
-  "iteration": 0,
-  "state": "IDLE",
-  "turn": "HUMAN",
+  "round": "r01",
+  "iteration": 1,
+  "state": "DEBATED",
+  "turn": "CLAUDE",
   "max_iterations": 3,
   "token_budget_per_entry": 800,
-  "round_file": null,
-  "last_updated": null,
+  "round_file": "collaboration/rounds/r01_architecture.md",
+  "last_updated": "2026-03-19T19:20:30.600659+00:00",
   "score_proximity_warning": false,
-  "history": []
+  "history": [],
+  "round_title": "architecture"
 }
