@@ -273,7 +273,8 @@ TS: 2026-03-19T04:15:23Z
   "human_gates": ["SPEC_READY", "VALIDATED"],
   "max_build_iterations": 3,
   "validation": {
-    "command": null,
+    "lint_command": "ruff check src/ && mypy src/ --ignore-missing-imports",
+    "command": "pytest tests/ -v",
     "timeout_seconds": 120,
     "on_failure": "reopen_round"
   },
@@ -302,7 +303,8 @@ TS: 2026-03-19T04:15:23Z
 | `max_build_iterations` | `3` | Max CODEX build attempts before escalating to human |
 | `build_agent` | `"CODEX"` | LLM that runs the BUILD phase |
 | `review_agent` | `"CLAUDE"` | LLM that runs CODE_REVIEW and QA_WRITE |
-| `validation.command` | `null` | Shell command to run in TEST phase; null skips to VALIDATED |
+| `validation.lint_command` | `"ruff check src/ && mypy src/ --ignore-missing-imports"` | Runs after every BUILD; failure blocks CODE_REVIEW approval |
+| `validation.command` | `"pytest tests/ -v"` | Runs in TEST phase; failure → QA_FAILED rebuild loop |
 
 ---
 
@@ -331,9 +333,30 @@ vim seed.md
 
 Create `calibration/scoring_examples.md` with 2–3 example SCORED entries annotated with why they received the scores they did. These are injected into every scoring prompt as anchors.
 
-### 3. (Optional) Configure validation
+### 3. Configure lint and test commands
 
-If your project produces testable artifacts, set `validation.command` in `config.json` to the shell command that validates them. The command runs from the repo root; exit 0 means VALIDATED, non-zero means FAILED.
+Edit `config.json → validation` to match your project's language and toolchain:
+
+```json
+"validation": {
+  "lint_command": "ruff check src/ && mypy src/ --ignore-missing-imports",
+  "command": "pytest tests/ -v",
+  "timeout_seconds": 120
+}
+```
+
+- `lint_command` runs **automatically after every CODEX build**. Failures are injected into the code review context and block approval — CODEX must fix them before the round can advance.
+- `command` runs in the **TEST phase** after CLAUDE writes the test suite. Failure triggers a rebuild loop (`QA_FAILED → BUILD`).
+
+Both commands run from the repo root. Adjust for your language:
+
+| Language | lint_command | command |
+|---|---|---|
+| Python | `ruff check src/ && mypy src/ --ignore-missing-imports` | `pytest tests/ -v` |
+| Node/TS | `eslint src/ && tsc --noEmit` | `npm test` |
+| Go | `golangci-lint run ./...` | `go test ./...` |
+
+> **These are not optional.** Leaving them unset means lint and tests do not run. Code will not be verified.
 
 ### 4. Initialize
 
@@ -377,8 +400,8 @@ Once a round is `AGREED`, issue `BEGIN_BUILD` at the `>>>` prompt to enter the S
 
 1. **SPEC** — CLAUDE writes a detailed implementation spec to `collaboration/spec.md`
 2. **SPEC_READY** — Human gate (default). Review the spec, then issue `BEGIN_BUILD` to approve it and start CODEX
-3. **BUILD** — CODEX (`--full-auto`) reads the spec and writes implementation files to `src/`
-4. **CODE_REVIEW** — CLAUDE reviews the code against the spec, either approving or requesting rework
+3. **BUILD** — CODEX (`--full-auto`) reads the spec and writes implementation files to `src/`. Lint runs automatically (`validation.lint_command`). Lint failures are injected into the code review context and **block approval**.
+4. **CODE_REVIEW** — CLAUDE reviews the code against the spec. If lint failed OR acceptance criteria aren't met: REWORK REQUIRED → back to BUILD
 5. **QA_WRITE** — CLAUDE writes a pytest test suite to `tests/`
 6. **TEST** — `validation.command` runs; exit 0 → VALIDATED, non-zero → QA_FAILED (rebuild loop)
 7. **VALIDATED** — Human gate (default). Issue `APPROVE_NEXT_ROUND` to advance to IDLE

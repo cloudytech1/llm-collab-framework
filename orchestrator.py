@@ -274,7 +274,10 @@ def build_system_prompt(llm_id: str, state: dict, config: dict) -> str:
     failure_context = ""
     last_failure = state.get("last_validation_failure")
     if last_failure:
-        failure_context = f"\n== LAST VALIDATION FAILURE ==\n{last_failure}\n"
+        failure_context += f"\n== LAST TEST FAILURE ==\n{last_failure}\n"
+    last_lint = state.get("last_lint_failure")
+    if last_lint:
+        failure_context += f"\n== LAST LINT FAILURE ==\n{last_lint}\n"
 
     return f"""You are {llm_id} in a structured LLM collaboration framework.
 You are debating technical decisions with your counterpart to produce the best possible outcome.
@@ -1021,14 +1024,47 @@ def run_implement_turn(state: dict, config: dict, dry_run: bool = False):
     print("  [IMPLEMENT] Done. Running validation...")
 
 
+def run_lint_check(state: dict, config: dict, dry_run: bool = False) -> tuple[int, str]:
+    """
+    Run the configured lint command. Returns (exit_code, output_text).
+    Called automatically after every BUILD iteration.
+    """
+    validation = config.get("validation", {})
+    lint_cmd = validation.get("lint_command")
+
+    if not lint_cmd:
+        return 0, "(no lint_command configured)"
+
+    timeout = validation.get("timeout_seconds", 120)
+    print(f"  [LINT] Running: {lint_cmd}")
+
+    if dry_run:
+        return 0, "DRY RUN — lint skipped"
+
+    try:
+        result = subprocess.run(
+            lint_cmd, shell=True, capture_output=True, text=True, timeout=timeout, cwd=REPO_ROOT
+        )
+        output = f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
+        status = "PASSED" if result.returncode == 0 else "FAILED"
+        print(f"  [LINT] {status} (exit {result.returncode})")
+        return result.returncode, output
+    except subprocess.TimeoutExpired:
+        print(f"  [LINT] TIMEOUT after {timeout}s")
+        return 1, f"TIMEOUT after {timeout}s"
+
+
 def run_test_phase(state: dict, config: dict, dry_run: bool = False, fail_state: str = "FAILED"):
-    """Run the configured validation command and transition to VALIDATED or fail_state."""
+    """Run the configured test command and transition to VALIDATED or fail_state."""
     validation = config.get("validation", {})
     cmd = validation.get("command")
 
     if not cmd:
-        print("  [TEST] No validation.command in config — skipping to VALIDATED")
+        print("  [TEST] WARNING: validation.command is not set in config.json.")
+        print("  [TEST] Set validation.command to your test runner (e.g. 'pytest tests/ -v').")
+        print("  [TEST] Skipping to VALIDATED — tests were NOT run.")
         state["state"] = "VALIDATED"
+        state["last_validation_failure"] = "validation.command not configured — tests skipped"
         save_state(state)
         return
 
@@ -1070,7 +1106,7 @@ def run_test_phase(state: dict, config: dict, dry_run: bool = False, fail_state:
     )
 
     state["state"] = status
-    if status == "FAILED":
+    if status not in ("VALIDATED",):
         state["last_validation_failure"] = result_text[:500]
     save_state(state)
     git_commit(f"{state['round']}_{status}")
@@ -1303,9 +1339,15 @@ def run_build_phase(state: dict, config: dict, dry_run: bool = False):
     output = invoke_llm("CODEX", prompt, sys_prompt, dry_run)
     duration = round(time.time() - t0, 2)
 
+    # Auto-run lint immediately after build
+    lint_exit, lint_output = run_lint_check(state, config, dry_run)
+    lint_status = "PASSED" if lint_exit == 0 else "FAILED"
+
     build_log = VALIDATIONS_DIR / f"{state['round']}_build_{build_iter}.md"
     build_log.write_text(
-        f"# Build Log — {state['round']} iter {build_iter}\nTS: {now_iso()}\n\n{output}\n"
+        f"# Build Log — {state['round']} iter {build_iter}\nTS: {now_iso()}\n\n"
+        f"## Build Summary\n{output}\n\n"
+        f"## Lint Check: {lint_status}\n```\n{lint_output}\n```\n"
     )
 
     append_metric(
@@ -1316,15 +1358,20 @@ def run_build_phase(state: dict, config: dict, dry_run: bool = False):
             "action": "BUILD",
             "duration_s": duration,
             "output_len": len(output),
+            "lint_status": lint_status,
         }
     )
 
     state["state"] = "CODE_REVIEW"
     state["turn"] = "CLAUDE"
     state["build_iteration"] = build_iter
+    if lint_exit != 0:
+        state["last_lint_failure"] = lint_output[:500]
+    else:
+        state.pop("last_lint_failure", None)
     save_state(state)
-    git_commit(f"{state['round']}_BUILD_iter{build_iter}")
-    print(f"  [BUILD] Done. Logged to {build_log.relative_to(REPO_ROOT)}")
+    git_commit(f"{state['round']}_BUILD_iter{build_iter}_lint_{lint_status}")
+    print(f"  [BUILD] Done. Lint: {lint_status}. Log: {build_log.relative_to(REPO_ROOT)}")
 
 
 def run_code_review_phase(state: dict, config: dict, dry_run: bool = False):
@@ -1340,11 +1387,18 @@ def run_code_review_phase(state: dict, config: dict, dry_run: bool = False):
     build_iter = state.get("build_iteration", 1)
     build_log_path = VALIDATIONS_DIR / f"{state['round']}_build_{build_iter}.md"
     build_summary = build_log_path.read_text() if build_log_path.exists() else "(no build log)"
+    lint_failure = state.get("last_lint_failure", "")
+    lint_section = (
+        f"\n== LINT FAILURES (must be fixed before APPROVED) ==\n{lint_failure}\n"
+        if lint_failure
+        else ""
+    )
 
     prompt = (
         "You are the Code Reviewer. Review the implementation against the spec.\n\n"
         f"== SPEC ==\n{spec_text}\n\n"
-        f"== BUILD SUMMARY ==\n{build_summary}\n\n"
+        f"== BUILD LOG (includes lint results) ==\n{build_summary}\n\n"
+        f"{lint_section}"
         "Also examine the files written under src/.\n\n"
         "Your review MUST include:\n\n"
         "## Verdict\n"
@@ -1380,7 +1434,9 @@ def run_code_review_phase(state: dict, config: dict, dry_run: bool = False):
         }
     )
 
-    approved = "APPROVED" in output.upper().split("\n")[0:5]  # check first 5 lines for verdict
+    # Lint failures block approval regardless of review content
+    lint_failed = bool(state.get("last_lint_failure"))
+    approved = not lint_failed and "APPROVED" in "\n".join(output.upper().split("\n")[0:5])
     max_build = config.get("max_build_iterations", 3)
 
     if approved:

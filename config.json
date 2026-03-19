@@ -39,7 +39,8 @@
   "git_auto_commit": true,
   "stuck_state_timeout_hours": 24,
   "validation": {
-    "command": null,
+    "lint_command": "ruff check src/ && mypy src/ --ignore-missing-imports",
+    "command": "pytest tests/ -v",
     "timeout_seconds": 120,
     "on_failure": "reopen_round"
   },
