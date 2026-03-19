@@ -5,11 +5,10 @@ Drives a structured debate between two LLMs (CLAUDE + CODEX) on a shared git rep
 """
 
 import json
-import os
+import re
 import subprocess
 import sys
 import time
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -33,9 +32,19 @@ INDEX_FILE = REPO_ROOT / "collaboration" / "index.yaml"
 METRICS_FILE = REPO_ROOT / "metrics.jsonl"
 
 VALID_STATES = [
-    "IDLE", "PROPOSED", "DEBATED", "SCORED", "SYNTHESIZED",
-    "AGREED", "DEADLOCKED", "HUMAN_REVIEW",
-    "IMPLEMENT", "TEST", "VALIDATED", "FAILED", "COMPLETE"
+    "IDLE",
+    "PROPOSED",
+    "DEBATED",
+    "SCORED",
+    "SYNTHESIZED",
+    "AGREED",
+    "DEADLOCKED",
+    "HUMAN_REVIEW",
+    "IMPLEMENT",
+    "TEST",
+    "VALIDATED",
+    "FAILED",
+    "COMPLETE",
 ]
 VALID_TURNS = ["CLAUDE", "CODEX", "HUMAN"]
 LLM_IDS = ["CLAUDE", "CODEX"]
@@ -44,40 +53,57 @@ LLM_IDS = ["CLAUDE", "CODEX"]
 # Directory bootstrap
 # ──────────────────────────────────────────────────────────────────────
 
+
 def ensure_dirs():
     """Create all required directories on first run."""
-    for d in [ROUNDS_DIR, DECISIONS_DIR, PLEAS_DIR, CALIBRATION_DIR,
-              VALIDATIONS_DIR, COMPROMISE_DIR]:
+    for d in [
+        ROUNDS_DIR,
+        DECISIONS_DIR,
+        PLEAS_DIR,
+        CALIBRATION_DIR,
+        VALIDATIONS_DIR,
+        COMPROMISE_DIR,
+    ]:
         d.mkdir(parents=True, exist_ok=True)
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Config & State helpers
 # ──────────────────────────────────────────────────────────────────────
 
+
 def load_json(path: Path) -> dict:
     with open(path) as f:
-        return json.load(f)
+        result: dict = json.load(f)
+        return result
+
 
 def save_json(path: Path, data: dict):
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
 
+
 def load_config() -> dict:
     return load_json(CONFIG_FILE)
 
+
 def load_state() -> dict:
     return load_json(STATE_FILE)
+
 
 def save_state(state: dict):
     state["last_updated"] = datetime.now(timezone.utc).isoformat()
     save_json(STATE_FILE, state)
 
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Metrics
 # ──────────────────────────────────────────────────────────────────────
+
 
 def append_metric(record: dict):
     """Append a single JSON record to metrics.jsonl."""
@@ -85,9 +111,11 @@ def append_metric(record: dict):
     with open(METRICS_FILE, "a") as f:
         f.write(json.dumps(record) + "\n")
 
+
 # ──────────────────────────────────────────────────────────────────────
 # Write Lock Protocol
 # ──────────────────────────────────────────────────────────────────────
+
 
 class WriteLock:
     """Context manager for the state.lock file."""
@@ -130,9 +158,11 @@ class WriteLock:
                 pass
         return False
 
+
 # ──────────────────────────────────────────────────────────────────────
 # Git helpers
 # ──────────────────────────────────────────────────────────────────────
+
 
 def git_commit(message: str):
     config = load_config()
@@ -142,11 +172,14 @@ def git_commit(message: str):
         subprocess.run(["git", "add", "-A"], cwd=REPO_ROOT, check=True, capture_output=True)
         subprocess.run(
             ["git", "commit", "-m", message, "--allow-empty"],
-            cwd=REPO_ROOT, check=True, capture_output=True
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
         )
         print(f"  [git] committed: {message}")
     except subprocess.CalledProcessError:
         print("  [git] commit skipped (no changes or git not initialized)")
+
 
 def git_init_if_needed():
     git_dir = REPO_ROOT / ".git"
@@ -155,42 +188,52 @@ def git_init_if_needed():
             subprocess.run(["git", "init"], cwd=REPO_ROOT, check=True, capture_output=True)
             subprocess.run(
                 ["git", "config", "user.email", "orchestrator@llm-collab"],
-                cwd=REPO_ROOT, check=True, capture_output=True
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
             )
             subprocess.run(
                 ["git", "config", "user.name", "LLM Collab Orchestrator"],
-                cwd=REPO_ROOT, check=True, capture_output=True
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
             )
             subprocess.run(["git", "add", "-A"], cwd=REPO_ROOT, check=True, capture_output=True)
             subprocess.run(
                 ["git", "commit", "-m", "initial scaffold"],
-                cwd=REPO_ROOT, check=True, capture_output=True
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
             )
             print("[git] initialized repository")
         except subprocess.CalledProcessError as e:
             print(f"[git] init warning: {e}")
 
+
 # ──────────────────────────────────────────────────────────────────────
 # Round Index
 # ──────────────────────────────────────────────────────────────────────
+
 
 def update_index(state: dict, outcome: str, summary: str):
     """Append a round entry to collaboration/index.yaml."""
     entry_lines = [
         f"- id: {state['round']}",
-        f"  title: \"{state.get('round_title', state['round'])}\"",
+        f'  title: "{state.get("round_title", state["round"])}"',
         f"  outcome: {outcome}",
         f"  iteration_count: {state['iteration']}",
-        f"  file: \"{state.get('round_file', '')}\"",
-        f"  summary: \"{summary.replace(chr(34), chr(39))}\"",
+        f'  file: "{state.get("round_file", "")}"',
+        f'  summary: "{summary.replace(chr(34), chr(39))}"',
         f"  ts: {now_iso()}",
     ]
     with open(INDEX_FILE, "a") as f:
         f.write("\n".join(entry_lines) + "\n\n")
 
+
 # ──────────────────────────────────────────────────────────────────────
 # System Prompt Generator
 # ──────────────────────────────────────────────────────────────────────
+
 
 def build_system_prompt(llm_id: str, state: dict, config: dict) -> str:
     """Build the system prompt injected into every LLM invocation."""
@@ -228,10 +271,10 @@ You are debating technical decisions with your counterpart to produce the best p
 == ROLE ==
 Your ID: {llm_id}
 Opponent: {"CODEX" if llm_id == "CLAUDE" else "CLAUDE"}
-Current round: {state['round']}
-Current iteration: {state['iteration']}
-Current state: {state['state']}
-Max iterations this round: {state['max_iterations']}
+Current round: {state["round"]}
+Current iteration: {state["iteration"]}
+Current state: {state["state"]}
+Max iterations this round: {state["max_iterations"]}
 
 == PROJECT SEED (IMMUTABLE) ==
 {seed_text}
@@ -258,14 +301,14 @@ A score of 1 or 5 on any dimension MUST be accompanied by a code block or concre
 3. Forbidden phrases — NEVER use: {forbidden}
 4. No prose preamble. No affirmations. No social padding.
 5. Lead with technical substance. Use bullets, code blocks, structured lists.
-6. Stay within {config.get('token_budget_per_entry', 800)} token budget per entry.
+6. Stay within {config.get("token_budget_per_entry", 800)} token budget per entry.
 
 == ENTRY FORMAT ==
 Start every entry with this exact YAML header:
 ---
 FROM: {llm_id}
-ROUND: {state['round']}
-ITER: {state['iteration']}
+ROUND: {state["round"]}
+ITER: {state["iteration"]}
 STATE: PROPOSED | SCORED | SYNTHESIZED | PLEA
 TS: [current ISO timestamp]
 ---
@@ -279,9 +322,11 @@ Then write your technical content below the header.
 - If a concept needs >3 sentences → use a code block or structured list
 """
 
+
 # ──────────────────────────────────────────────────────────────────────
 # CLI Invocation Wrappers
 # ──────────────────────────────────────────────────────────────────────
+
 
 def invoke_claude(prompt: str, system_prompt: str, dry_run: bool = False) -> str:
     """Invoke Claude Code CLI."""
@@ -307,7 +352,7 @@ def invoke_claude(prompt: str, system_prompt: str, dry_run: bool = False) -> str
         print(f"\n  [DRY RUN] Would invoke CLAUDE ({len(prompt)} char prompt)")
         return _dry_run_stub("CLAUDE")
 
-    print(f"  [CLAUDE] invoking claude CLI...")
+    print("  [CLAUDE] invoking claude CLI...")
     try:
         result = subprocess.run(
             full_cmd, capture_output=True, text=True, timeout=300, cwd=REPO_ROOT
@@ -319,7 +364,10 @@ def invoke_claude(prompt: str, system_prompt: str, dry_run: bool = False) -> str
     except subprocess.TimeoutExpired:
         raise RuntimeError("CLAUDE CLI timed out after 300s")
     except FileNotFoundError:
-        raise RuntimeError("'claude' CLI not found. Install Claude Code: https://docs.anthropic.com/en/docs/claude-code")
+        raise RuntimeError(
+            "'claude' CLI not found. Install Claude Code: https://docs.anthropic.com/en/docs/claude-code"
+        )
+
 
 def invoke_codex(prompt: str, system_prompt: str, dry_run: bool = False) -> str:
     """Invoke OpenAI Codex CLI."""
@@ -338,7 +386,7 @@ def invoke_codex(prompt: str, system_prompt: str, dry_run: bool = False) -> str:
         print(f"\n  [DRY RUN] Would invoke CODEX ({len(combined_prompt)} char prompt)")
         return _dry_run_stub("CODEX")
 
-    print(f"  [CODEX] invoking codex CLI...")
+    print("  [CODEX] invoking codex CLI...")
     try:
         result = subprocess.run(
             full_cmd, capture_output=True, text=True, timeout=300, cwd=REPO_ROOT
@@ -351,6 +399,7 @@ def invoke_codex(prompt: str, system_prompt: str, dry_run: bool = False) -> str:
         raise RuntimeError("CODEX CLI timed out after 300s")
     except FileNotFoundError:
         raise RuntimeError("'codex' CLI not found. Install: npm install -g @openai/codex")
+
 
 def _dry_run_stub(llm_id: str) -> str:
     """Return a realistic stub entry for dry-run mode."""
@@ -372,6 +421,7 @@ Replace with actual LLM output by running without --dry-run.
 - Point 3: [technical detail]
 """
 
+
 def invoke_llm(llm_id: str, prompt: str, system_prompt: str, dry_run: bool = False) -> str:
     if llm_id == "CLAUDE":
         return invoke_claude(prompt, system_prompt, dry_run)
@@ -380,9 +430,11 @@ def invoke_llm(llm_id: str, prompt: str, system_prompt: str, dry_run: bool = Fal
     else:
         raise ValueError(f"Unknown LLM ID: {llm_id}")
 
+
 # ──────────────────────────────────────────────────────────────────────
 # Forbidden Phrase Checker
 # ──────────────────────────────────────────────────────────────────────
+
 
 def check_forbidden_phrases(text: str, config: dict) -> list[str]:
     """Return list of forbidden phrases found in text."""
@@ -392,37 +444,44 @@ def check_forbidden_phrases(text: str, config: dict) -> list[str]:
             violations.append(phrase)
     return violations
 
+
 # ──────────────────────────────────────────────────────────────────────
 # Score Parser & Proximity Check
 # ──────────────────────────────────────────────────────────────────────
 
+
 def parse_scores_from_entry(text: str) -> Optional[float]:
     """Extract the TOTAL weighted score from a SCORED entry."""
-    match = re.search(r'\*\*TOTAL\*\*\s*\|\s*\*\*(\d+\.?\d*)\*\*', text)
+    # Bold format: **TOTAL** ... **X.XX** (any number of pipe-separated columns)
+    match = re.search(r"\*\*TOTAL\*\*[^\n]*\*\*(\d+\.?\d*)\*\*", text)
     if match:
         return float(match.group(1))
-    match = re.search(r'TOTAL\s*\|\s*(\d+\.?\d*)', text, re.IGNORECASE)
+    # Plain format fallback: TOTAL | X.XX
+    match = re.search(r"TOTAL\s*\|\s*(\d+\.?\d*)", text, re.IGNORECASE)
     if match:
         return float(match.group(1))
     return None
+
 
 def check_score_proximity(score_a: Optional[float], score_b: Optional[float], config: dict) -> bool:
     """Return True if scores are suspiciously close (proximity warning)."""
     if score_a is None or score_b is None:
         return False
-    delta = config.get("score_proximity_warning_delta", 0.3)
+    delta = float(config.get("score_proximity_warning_delta", 0.3))
     return abs(score_a - score_b) < delta
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Round File Management
 # ──────────────────────────────────────────────────────────────────────
+
 
 def create_round_file(round_id: str, title: str) -> Path:
     """Create a new round file with header."""
     filename = f"{round_id}_{title.lower().replace(' ', '_')}.md"
     filepath = ROUNDS_DIR / filename
     header = f"""# Round {round_id} — {title}
-BUDGET: {load_config().get('token_budget_per_round_file', 6000)} tokens | OPENED: {datetime.now(timezone.utc).strftime('%Y-%m-%d')} | STATUS: ACTIVE
+BUDGET: {load_config().get("token_budget_per_round_file", 6000)} tokens | OPENED: {datetime.now(timezone.utc).strftime("%Y-%m-%d")} | STATUS: ACTIVE
 
 ---
 
@@ -430,16 +489,19 @@ BUDGET: {load_config().get('token_budget_per_round_file', 6000)} tokens | OPENED
     filepath.write_text(header)
     return filepath
 
+
 def append_to_round_file(filepath: Path, entry: str):
     """Append an entry to the round file."""
     current = filepath.read_text()
     filepath.write_text(current + "\n" + entry + "\n")
+
 
 def close_round_file(filepath: Path):
     """Mark a round file as CLOSED."""
     current = filepath.read_text()
     updated = current.replace("STATUS: ACTIVE", "STATUS: CLOSED")
     filepath.write_text(updated)
+
 
 def append_decision_summary(accepted: bool, round_id: str, summary: str):
     """Append a decision summary to accepted.md or rejected.md."""
@@ -448,18 +510,21 @@ def append_decision_summary(accepted: bool, round_id: str, summary: str):
     entry = f"\n## {round_id} — {now_iso()}\n\n{summary}\n\n---\n"
     target.write_text(current + entry)
 
+
 # ──────────────────────────────────────────────────────────────────────
 # Human Interface
 # ──────────────────────────────────────────────────────────────────────
 
+
 def notify_human(message: str):
     """Notify the human operator."""
-    print(f"\n{'='*60}")
-    print(f"  HUMAN REVIEW REQUIRED")
-    print(f"{'='*60}")
+    print(f"\n{'=' * 60}")
+    print("  HUMAN REVIEW REQUIRED")
+    print(f"{'=' * 60}")
     print(f"  {message}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
     print("\a", end="")
+
 
 def prompt_human_review(state: dict) -> str:
     """Block on human input at a HUMAN_REVIEW gate. Returns the command string."""
@@ -511,9 +576,11 @@ def prompt_human_review(state: dict) -> str:
             continue
         print(f"  Unknown command: {cmd}")
 
+
 # ──────────────────────────────────────────────────────────────────────
 # R01 Seeding — LLM decomposes seed.md into rounds
 # ──────────────────────────────────────────────────────────────────────
+
 
 def seed_r01(dry_run: bool = False):
     """
@@ -547,8 +614,16 @@ def seed_r01(dry_run: bool = False):
     with WriteLock("CLAUDE"):
         t0 = time.time()
         claude_output = invoke_llm("CLAUDE", proposal_prompt, sys_prompt, dry_run)
-        append_metric({"round": "r01", "iter": 1, "llm": "CLAUDE", "action": "PROPOSED",
-                        "duration_s": round(time.time() - t0, 2), "output_len": len(claude_output)})
+        append_metric(
+            {
+                "round": "r01",
+                "iter": 1,
+                "llm": "CLAUDE",
+                "action": "PROPOSED",
+                "duration_s": round(time.time() - t0, 2),
+                "output_len": len(claude_output),
+            }
+        )
         append_to_round_file(rf, claude_output)
         state["turn"] = "CODEX"
         state["state"] = "DEBATED"
@@ -571,8 +646,16 @@ def seed_r01(dry_run: bool = False):
     with WriteLock("CODEX"):
         t0 = time.time()
         codex_output = invoke_llm("CODEX", critique_prompt, sys_prompt, dry_run)
-        append_metric({"round": "r01", "iter": 1, "llm": "CODEX", "action": "SCORED",
-                        "duration_s": round(time.time() - t0, 2), "output_len": len(codex_output)})
+        append_metric(
+            {
+                "round": "r01",
+                "iter": 1,
+                "llm": "CODEX",
+                "action": "SCORED",
+                "duration_s": round(time.time() - t0, 2),
+                "output_len": len(codex_output),
+            }
+        )
         append_to_round_file(rf, codex_output)
         state["turn"] = "HUMAN"
         state["state"] = "HUMAN_REVIEW"
@@ -584,12 +667,15 @@ def seed_r01(dry_run: bool = False):
     cmd = prompt_human_review(state)
     handle_human_command(cmd, state, config)
 
+
 # ──────────────────────────────────────────────────────────────────────
 # State Machine Core
 # ──────────────────────────────────────────────────────────────────────
 
+
 def other_llm(llm_id: str) -> str:
     return "CODEX" if llm_id == "CLAUDE" else "CLAUDE"
+
 
 def run_proposal_turn(state: dict, config: dict, dry_run: bool = False):
     """Execute a PROPOSED turn: the current LLM writes a proposal."""
@@ -615,13 +701,22 @@ def run_proposal_turn(state: dict, config: dict, dry_run: bool = False):
             print(f"  [WARN] {llm_id} used forbidden phrases: {violations}")
 
         append_to_round_file(rf, output)
-        append_metric({"round": state["round"], "iter": state["iteration"], "llm": llm_id,
-                        "action": "PROPOSED", "duration_s": duration, "output_len": len(output)})
+        append_metric(
+            {
+                "round": state["round"],
+                "iter": state["iteration"],
+                "llm": llm_id,
+                "action": "PROPOSED",
+                "duration_s": duration,
+                "output_len": len(output),
+            }
+        )
         state["turn"] = other_llm(llm_id)
         state["state"] = "PROPOSED"
         save_state(state)
 
     git_commit(f"{state['round']}_iter{state['iteration']}_{llm_id}_proposed")
+
 
 def run_scoring_turn(state: dict, config: dict, dry_run: bool = False) -> str:
     """Execute a SCORED turn: the current LLM scores the opposing proposal."""
@@ -652,14 +747,23 @@ def run_scoring_turn(state: dict, config: dict, dry_run: bool = False) -> str:
 
         score = parse_scores_from_entry(output)
         append_to_round_file(rf, output)
-        append_metric({"round": state["round"], "iter": state["iteration"], "llm": llm_id,
-                        "action": "SCORED", "score_given": score,
-                        "duration_s": duration, "output_len": len(output)})
+        append_metric(
+            {
+                "round": state["round"],
+                "iter": state["iteration"],
+                "llm": llm_id,
+                "action": "SCORED",
+                "score_given": score,
+                "duration_s": duration,
+                "output_len": len(output),
+            }
+        )
         state["state"] = "SCORED"
         save_state(state)
 
     git_commit(f"{state['round']}_iter{state['iteration']}_{llm_id}_scored")
     return output
+
 
 def run_synthesis_turn(state: dict, config: dict, dry_run: bool, loser_llm: str):
     """The lower-scoring LLM synthesizes a merged proposal."""
@@ -693,12 +797,21 @@ def run_synthesis_turn(state: dict, config: dict, dry_run: bool, loser_llm: str)
             print(f"  [WARN] {loser_llm} used forbidden phrases in synthesis: {violations}")
 
         append_to_round_file(rf, output)
-        append_metric({"round": state["round"], "iter": state["iteration"], "llm": loser_llm,
-                        "action": "SYNTHESIZED", "duration_s": duration, "output_len": len(output)})
+        append_metric(
+            {
+                "round": state["round"],
+                "iter": state["iteration"],
+                "llm": loser_llm,
+                "action": "SYNTHESIZED",
+                "duration_s": duration,
+                "output_len": len(output),
+            }
+        )
         state["state"] = "SYNTHESIZED"
         save_state(state)
 
     git_commit(f"{state['round']}_iter{state['iteration']}_{loser_llm}_synthesized")
+
 
 def generate_compromise_template(state: dict, config: dict, dry_run: bool = False):
     """Generate a structured compromise form on DEADLOCK."""
@@ -720,9 +833,16 @@ def generate_compromise_template(state: dict, config: dict, dry_run: bool = Fals
 
     t0 = time.time()
     output = invoke_llm("CLAUDE", prompt, sys_prompt, dry_run)
-    append_metric({"round": state["round"], "iter": state["iteration"], "llm": "CLAUDE",
-                    "action": "COMPROMISE_TEMPLATE", "duration_s": round(time.time() - t0, 2),
-                    "output_len": len(output)})
+    append_metric(
+        {
+            "round": state["round"],
+            "iter": state["iteration"],
+            "llm": "CLAUDE",
+            "action": "COMPROMISE_TEMPLATE",
+            "duration_s": round(time.time() - t0, 2),
+            "output_len": len(output),
+        }
+    )
 
     full_template = (
         f"# Deadlock Compromise Template — Round {state['round']}\n"
@@ -733,6 +853,7 @@ def generate_compromise_template(state: dict, config: dict, dry_run: bool = Fals
     template_path.write_text(full_template)
     git_commit(f"{state['round']}_compromise_template")
     print(f"  [DEADLOCK] Compromise template: {template_path.relative_to(REPO_ROOT)}")
+
 
 def run_debate_iteration(state: dict, config: dict, dry_run: bool = False):
     """
@@ -776,7 +897,7 @@ def run_debate_iteration(state: dict, config: dict, dry_run: bool = False):
     if check_score_proximity(score_a, score_b, config):
         state["score_proximity_warning"] = True
         save_state(state)
-        print(f"  [WARN] Score proximity warning — scores within delta")
+        print("  [WARN] Score proximity warning — scores within delta")
 
     # Determine loser: lower score = loser (synthesizer)
     # score_a is for second, score_b is for first
@@ -792,7 +913,7 @@ def run_debate_iteration(state: dict, config: dict, dry_run: bool = False):
     state["iteration"] += 1
 
     if state["iteration"] > state["max_iterations"]:
-        print(f"  Max iterations reached — DEADLOCKED")
+        print("  Max iterations reached — DEADLOCKED")
         state["state"] = "DEADLOCKED"
         state["turn"] = "HUMAN"
         save_state(state)
@@ -801,6 +922,7 @@ def run_debate_iteration(state: dict, config: dict, dry_run: bool = False):
         state["state"] = "HUMAN_REVIEW"
         state["turn"] = "HUMAN"
         save_state(state)
+
 
 def run_plea_protocol(state: dict, config: dict, dry_run: bool = False):
     """Generate plea files and compromise template on DEADLOCK."""
@@ -823,9 +945,16 @@ def run_plea_protocol(state: dict, config: dict, dry_run: bool = False):
         with WriteLock(llm_id):
             t0 = time.time()
             output = invoke_llm(llm_id, prompt, sys_prompt, dry_run)
-            append_metric({"round": state["round"], "iter": state["iteration"], "llm": llm_id,
-                            "action": "PLEA", "duration_s": round(time.time() - t0, 2),
-                            "output_len": len(output)})
+            append_metric(
+                {
+                    "round": state["round"],
+                    "iter": state["iteration"],
+                    "llm": llm_id,
+                    "action": "PLEA",
+                    "duration_s": round(time.time() - t0, 2),
+                    "output_len": len(output),
+                }
+            )
             plea_path.write_text(output)
 
         git_commit(f"{state['round']}_plea_{llm_id}")
@@ -836,9 +965,11 @@ def run_plea_protocol(state: dict, config: dict, dry_run: bool = False):
     state["state"] = "HUMAN_REVIEW"
     save_state(state)
 
+
 # ──────────────────────────────────────────────────────────────────────
 # Implementation & Validation
 # ──────────────────────────────────────────────────────────────────────
+
 
 def run_implement_turn(state: dict, config: dict, dry_run: bool = False):
     """CLAUDE generates implementation artifacts based on accepted decisions."""
@@ -857,17 +988,24 @@ def run_implement_turn(state: dict, config: dict, dry_run: bool = False):
     duration = round(time.time() - t0, 2)
 
     impl_log = VALIDATIONS_DIR / f"{state['round']}_implement.md"
-    impl_log.write_text(
-        f"# Implementation Log — {state['round']}\nTS: {now_iso()}\n\n{output}\n"
+    impl_log.write_text(f"# Implementation Log — {state['round']}\nTS: {now_iso()}\n\n{output}\n")
+    append_metric(
+        {
+            "round": state["round"],
+            "iter": state["iteration"],
+            "llm": "CLAUDE",
+            "action": "IMPLEMENT",
+            "duration_s": duration,
+            "output_len": len(output),
+        }
     )
-    append_metric({"round": state["round"], "iter": state["iteration"], "llm": "CLAUDE",
-                    "action": "IMPLEMENT", "duration_s": duration, "output_len": len(output)})
 
     state["state"] = "TEST"
     state["turn"] = "HUMAN"
     save_state(state)
     git_commit(f"{state['round']}_IMPLEMENT")
     print("  [IMPLEMENT] Done. Running validation...")
+
 
 def run_test_phase(state: dict, config: dict, dry_run: bool = False):
     """Run the configured validation command and transition to VALIDATED or FAILED."""
@@ -891,8 +1029,7 @@ def run_test_phase(state: dict, config: dict, dry_run: bool = False):
     else:
         try:
             result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True,
-                timeout=timeout, cwd=REPO_ROOT
+                cmd, shell=True, capture_output=True, text=True, timeout=timeout, cwd=REPO_ROOT
             )
             exit_code = result.returncode
             result_text = f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
@@ -908,8 +1045,15 @@ def run_test_phase(state: dict, config: dict, dry_run: bool = False):
     )
 
     print(f"  [TEST] Exit code: {exit_code} → {status}")
-    append_metric({"round": state["round"], "iter": state["iteration"],
-                    "action": "TEST", "exit_code": exit_code, "status": status})
+    append_metric(
+        {
+            "round": state["round"],
+            "iter": state["iteration"],
+            "action": "TEST",
+            "exit_code": exit_code,
+            "status": status,
+        }
+    )
 
     state["state"] = status
     if status == "FAILED":
@@ -917,9 +1061,11 @@ def run_test_phase(state: dict, config: dict, dry_run: bool = False):
     save_state(state)
     git_commit(f"{state['round']}_{status}")
 
+
 # ──────────────────────────────────────────────────────────────────────
 # Human Command Handlers
 # ──────────────────────────────────────────────────────────────────────
+
 
 def handle_human_command(cmd: str, state: dict, config: dict):
     """Process a human operator command and update state."""
@@ -933,16 +1079,19 @@ def handle_human_command(cmd: str, state: dict, config: dict):
         rf = REPO_ROOT / state["round_file"]
         close_round_file(rf)
 
-        summary = (f"Accepted at iteration {state['iteration']}. "
-                   f"See {state['round_file']} for full discussion.")
+        summary = (
+            f"Accepted at iteration {state['iteration']}. "
+            f"See {state['round_file']} for full discussion."
+        )
         append_decision_summary(True, state["round"], summary)
         update_index(state, "AGREED", summary)
         git_commit(f"{state['round']}_HUMAN_APPROVED")
 
     elif cmd == "REJECT":
         print("  [HUMAN] Rejected. Round re-opens with fresh proposals.")
-        append_decision_summary(False, state["round"],
-            f"Rejected at iteration {state['iteration']}. Round re-opened.")
+        append_decision_summary(
+            False, state["round"], f"Rejected at iteration {state['iteration']}. Round re-opened."
+        )
         state["state"] = "DEBATED"
         state["iteration"] = 1
         state["turn"] = "CLAUDE"
@@ -968,8 +1117,10 @@ def handle_human_command(cmd: str, state: dict, config: dict):
         rf = REPO_ROOT / state["round_file"]
         close_round_file(rf)
 
-        summary = (f"OVERRIDE: Human forced acceptance of {winner}'s proposal. "
-                   f"See {state['round_file']} for full discussion.")
+        summary = (
+            f"OVERRIDE: Human forced acceptance of {winner}'s proposal. "
+            f"See {state['round_file']} for full discussion."
+        )
         append_decision_summary(True, state["round"], summary)
         update_index(state, "AGREED_OVERRIDE", summary)
         git_commit(f"{state['round']}_HUMAN_OVERRIDE_{winner}")
@@ -991,9 +1142,11 @@ def handle_human_command(cmd: str, state: dict, config: dict):
         print("  Exiting orchestrator.")
         sys.exit(0)
 
+
 # ──────────────────────────────────────────────────────────────────────
 # Stuck-State Detection
 # ──────────────────────────────────────────────────────────────────────
+
 
 def check_stuck_state(state: dict, config: dict):
     """Warn if the orchestrator has been in a non-human state too long."""
@@ -1007,32 +1160,42 @@ def check_stuck_state(state: dict, config: dict):
         last_dt = datetime.fromisoformat(last_updated)
         elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600
         if elapsed > timeout_hours:
-            print(f"\n  [WARN] Stuck state: '{state['state']}' unchanged for {elapsed:.1f}h "
-                  f"(threshold: {timeout_hours}h). Consider restarting or inspecting state.json.")
+            print(
+                f"\n  [WARN] Stuck state: '{state['state']}' unchanged for {elapsed:.1f}h "
+                f"(threshold: {timeout_hours}h). Consider restarting or inspecting state.json."
+            )
     except (ValueError, TypeError):
         pass
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Main Loop
 # ──────────────────────────────────────────────────────────────────────
+
 
 def next_round_id(current: str) -> str:
     """Increment round ID: r01 -> r02, etc."""
     num = int(current[1:]) + 1
     return f"r{num:02d}"
 
+
 def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="LLM Collaboration Framework Orchestrator")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Run with stub LLM outputs (no actual CLI calls)")
-    parser.add_argument("--init", action="store_true",
-                        help="Initialize git repo and run R01 seeding")
-    parser.add_argument("--resume", action="store_true",
-                        help="Resume from current state.json")
-    parser.add_argument("--round-title", type=str, default=None,
-                        help="Title for a new round (used with --resume when starting a new round)")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Run with stub LLM outputs (no actual CLI calls)"
+    )
+    parser.add_argument(
+        "--init", action="store_true", help="Initialize git repo and run R01 seeding"
+    )
+    parser.add_argument("--resume", action="store_true", help="Resume from current state.json")
+    parser.add_argument(
+        "--round-title",
+        type=str,
+        default=None,
+        help="Title for a new round (used with --resume when starting a new round)",
+    )
     args = parser.parse_args()
 
     ensure_dirs()
@@ -1053,8 +1216,10 @@ def main():
 
     # Resume or continue main loop
     state = load_state()
-    print(f"State: round={state['round']}, iter={state['iteration']}, "
-          f"state={state['state']}, turn={state['turn']}")
+    print(
+        f"State: round={state['round']}, iter={state['iteration']}, "
+        f"state={state['state']}, turn={state['turn']}"
+    )
 
     while True:
         state = load_state()
@@ -1119,7 +1284,7 @@ def main():
 
         elif state["state"] == "FAILED":
             print(f"\nRound {state['round']} FAILED validation.")
-            print(f"  Failure context injected into next debate iteration.")
+            print("  Failure context injected into next debate iteration.")
             state["state"] = "DEBATED"
             state["iteration"] = 1
             state["turn"] = "CLAUDE"
@@ -1129,6 +1294,7 @@ def main():
         else:
             print(f"Unknown state: {state['state']}")
             sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
